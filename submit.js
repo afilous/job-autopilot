@@ -11,8 +11,8 @@ const fs = require('fs');
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const DRY_RUN = process.argv.includes('--dry-run');
-const MAX_SUBMISSIONS = 10; // max per run
-const DELAY_BETWEEN_MS = 12000 + Math.random() * 8000; // 12-20s between submissions
+const MAX_SUBMISSIONS = 10;
+const DELAY_BETWEEN_MS = 12000 + Math.random() * 8000;
 
 const PROFILE = {
   full_name: 'Aaron Filous',
@@ -27,13 +27,10 @@ const PROFILE = {
   state: 'CA',
   zip: '94401',
   country: 'United States',
-  website: 'https://www.linkedin.com/in/aaron-filous/',
 };
 
-// ── Supabase ──────────────────────────────────────────────────────────────────
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-// ── Run log ───────────────────────────────────────────────────────────────────
 const runLog = {
   started_at: new Date().toISOString(),
   dry_run: DRY_RUN,
@@ -50,9 +47,8 @@ function sleep(ms) {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 async function main() {
-  log(DRY_RUN ? '🔍 DRY RUN mode — no actual submissions' : '🚀 Starting job submission run');
+  log(DRY_RUN ? '🔍 DRY RUN mode' : '🚀 Starting job submission run');
 
-  // 1. Get queued jobs with generated answers
   const { data: jobs, error } = await supabase
     .from('applications')
     .select('*')
@@ -62,39 +58,24 @@ async function main() {
     .order('match_score', { ascending: false })
     .limit(MAX_SUBMISSIONS);
 
-  if (error) {
-    log(`❌ Failed to fetch jobs: ${error.message}`);
-    process.exit(1);
-  }
-
-  if (!jobs || jobs.length === 0) {
-    log('✅ No jobs queued — nothing to submit');
-    saveLog();
-    return;
-  }
+  if (error) { log(`❌ Failed to fetch jobs: ${error.message}`); process.exit(1); }
+  if (!jobs || jobs.length === 0) { log('✅ No jobs queued — nothing to submit'); saveLog(); return; }
 
   log(`📋 Found ${jobs.length} jobs to submit`);
 
-  // 2. Get active resume
   const { data: resumeData } = await supabase
-    .from('resumes')
-    .select('*')
-    .eq('is_active', true)
-    .limit(1)
-    .single();
+    .from('resumes').select('*').eq('is_active', true).limit(1).single();
 
   const resumeText = resumeData?.raw_text || '';
   const resumePdfUrl = resumeData?.pdf_url || null;
-
   log(`📄 Resume: ${resumeData?.filename || 'default'}`);
 
-  // 3. Launch browser
   const browser = await chromium.launch({
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox'],
   });
 
-  let submitted = 0, failed = 0, skipped = 0;
+  let submitted = 0, failed = 0, manual = 0, skipped = 0;
 
   for (let i = 0; i < jobs.length; i++) {
     const job = jobs[i];
@@ -103,7 +84,7 @@ async function main() {
     log(`  Score: ${job.match_score}%`);
 
     if (DRY_RUN) {
-      log('  ⏭ DRY RUN — skipping actual submission');
+      log('  ⏭ DRY RUN — skipping');
       runLog.results.push({ job_id: job.id, job_title: job.job_title, company: job.company, status: 'dry_run' });
       skipped++;
       continue;
@@ -126,21 +107,29 @@ async function main() {
         result = await submitAshby(page, job, resumeText, resumePdfUrl);
       }
 
-      if (result.success) {
-        log(`  ✅ ${result.message}`);
+      if (result.manual) {
+        await supabase.from('applications').update({
+          status: 'manual',
+          notes: result.message,
+        }).eq('id', job.id);
+        log(`  → Marked for manual apply: ${result.message}`);
+        manual++;
+        runLog.results.push({ job_id: job.id, job_title: job.job_title, company: job.company, status: 'manual', message: result.message });
+      } else if (result.success) {
         await supabase.from('applications').update({
           status: 'submitted',
           submission_time: Math.floor(Date.now() / 1000),
           notes: result.message,
         }).eq('id', job.id);
+        log(`  ✅ ${result.message}`);
         submitted++;
         runLog.results.push({ job_id: job.id, job_title: job.job_title, company: job.company, status: 'submitted', message: result.message });
       } else {
-        log(`  ❌ ${result.message}`);
         await supabase.from('applications').update({
           status: 'failed',
           notes: result.message,
         }).eq('id', job.id);
+        log(`  ❌ ${result.message}`);
         failed++;
         runLog.results.push({ job_id: job.id, job_title: job.job_title, company: job.company, status: 'failed', message: result.message });
       }
@@ -157,10 +146,9 @@ async function main() {
       await context.close();
     }
 
-    // Human-paced delay between submissions
     if (i < jobs.length - 1) {
       const delay = Math.floor(DELAY_BETWEEN_MS);
-      log(`  ⏳ Waiting ${Math.round(delay / 1000)}s before next submission...`);
+      log(`  ⏳ Waiting ${Math.round(delay / 1000)}s...`);
       await sleep(delay);
     }
   }
@@ -170,34 +158,45 @@ async function main() {
   log(`\n────────────────────────────────`);
   log(`✅ Submitted: ${submitted}`);
   log(`❌ Failed: ${failed}`);
+  log(`📋 Manual: ${manual}`);
   log(`⏭ Skipped: ${skipped}`);
 
   runLog.completed_at = new Date().toISOString();
-  runLog.summary = { submitted, failed, skipped };
+  runLog.summary = { submitted, failed, manual, skipped };
   saveLog();
 }
 
 // ── Greenhouse ────────────────────────────────────────────────────────────────
 async function submitGreenhouse(page, job, resumeText, resumePdfUrl) {
   try {
-    // Navigate to job page
-    await page.goto(job.url, { waitUntil: 'networkidle', timeout: 30000 });
+    // Build direct application form URL
+    const baseUrl = job.url
+      .replace('boards.greenhouse.io', 'job-boards.greenhouse.io')
+      .replace(/\/$/, '');
+    const applyUrl = `${baseUrl}/applications/new`;
+
+    log(`  🌐 Navigating to: ${applyUrl}`);
+    await page.goto(applyUrl, { waitUntil: 'networkidle', timeout: 30000 });
     await page.waitForTimeout(2000);
 
-    // Click Apply button if present
-    const applyBtn = await page.$('a:has-text("Apply"), button:has-text("Apply"), a[href*="apply"], .apply-button');
-    if (applyBtn) {
-      await applyBtn.click();
-      await page.waitForTimeout(3000);
+    // Detect redirect to custom domain (Stripe, Databricks etc)
+    const finalUrl = page.url();
+    const finalDomain = new URL(finalUrl).hostname;
+    if (!finalDomain.includes('greenhouse.io')) {
+      log(`  ↪ Redirected to custom site: ${finalDomain}`);
+      return { success: false, manual: true, message: `Custom career site: ${finalDomain} — apply manually` };
     }
+
+    log(`  📍 On page: ${finalUrl}`);
 
     // Check if application form exists
-    const formExists = await page.$('#application-form, form[action*="application"], .application-form, #application');
+    const formExists = await page.$('#application-form, form[action*="application"], .application-form, #application, form#application_form');
     if (!formExists) {
-      log(`  ⚠ No form found at ${page.url()} — trying API fallback`);
-      return await submitGreenhouseAPI(job, resumeText);
+      log(`  ⚠ No form found — page title: ${await page.title()}`);
+      return { success: false, message: `No application form found at ${finalUrl}` };
     }
 
+    log(`  ✓ Form found — filling fields`);
     const answers = job.generated_responses || {};
 
     // Fill basic fields
@@ -207,71 +206,62 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl) {
     await fillField(page, '#phone, [name="job_application[phone]"]', PROFILE.phone_formatted);
     await fillField(page, '#resume_text, [name="job_application[resume_text]"]', resumeText);
 
-    // Fill LinkedIn
+    // LinkedIn
     const linkedinField = await page.$('[name*="linkedin"], [id*="linkedin"], [placeholder*="linkedin" i]');
     if (linkedinField) await linkedinField.fill(PROFILE.linkedin);
 
-    // Fill location
+    // Location
     await fillField(page, '#location, [name*="location"]', PROFILE.location);
 
-    // Fill custom questions from AI answers
+    // AI generated answers
     if (answers && typeof answers === 'object') {
       for (const [question, answer] of Object.entries(answers)) {
         await tryFillByLabel(page, question, String(answer));
       }
     }
 
-    // Handle work authorization dropdowns
+    // Work authorization dropdowns
     await handleDropdownByLabel(page, /authorized.*work|work.*authorized/i, 'Yes');
     await handleDropdownByLabel(page, /sponsorship|visa/i, 'No');
 
-    // Upload resume PDF if available
+    // Resume PDF upload
     if (resumePdfUrl) {
-      await uploadResumePdf(page, resumePdfUrl, '[name="job_application[resume]"], input[type="file"][accept*="pdf"]');
+      await uploadResumePdf(page, resumePdfUrl, '[name="job_application[resume]"], input[type="file"][accept*="pdf"], input[type="file"]');
     }
 
     // Submit
-    await page.click('#submit_app, [value="Submit Application"], button[type="submit"]');
-    await page.waitForTimeout(3000);
+    const submitBtn = await page.$('#submit_app, [value="Submit Application"], button[type="submit"], input[type="submit"]');
+    if (!submitBtn) {
+      return { success: false, message: 'Submit button not found' };
+    }
+    await submitBtn.click();
+    await page.waitForTimeout(4000);
 
-    // Check for success
+    // Check result
+    const finalPageUrl = page.url();
+    const pageTitle = await page.title();
     const pageText = await page.textContent('body');
-    if (pageText.match(/thank you|application received|submitted|we.ll be in touch/i)) {
-      return { success: true, message: 'Submitted via Greenhouse form' };
+    log(`  📍 After submit: ${finalPageUrl}`);
+    log(`  📍 Title: ${pageTitle}`);
+    log(`  📍 Text: ${pageText.slice(0, 200)}`);
+
+    if (pageText.match(/thank you|application received|submitted|we.ll be in touch|confirmation/i)) {
+      return { success: true, message: 'Submitted via Greenhouse form ✓' };
     }
 
-    return { success: true, message: 'Form submitted (unconfirmed)' };
+    if (pageText.match(/error|required|invalid|please fill|can.t be blank/i)) {
+      return { success: false, message: `Form validation error — check required fields` };
+    }
+
+    // URL changed = likely success
+    if (finalPageUrl !== applyUrl) {
+      return { success: true, message: `Submitted — redirected to ${finalPageUrl}` };
+    }
+
+    return { success: false, message: `Submitted but no confirmation detected — title: ${pageTitle}` };
 
   } catch (err) {
-    // Fallback to API
-    return await submitGreenhouseAPI(job, resumeText);
-  }
-}
-
-async function submitGreenhouseAPI(job, resumeText) {
-  try {
-    const res = await fetch(
-      `https://boards-api.greenhouse.io/v1/boards/${job.ats_slug}/jobs/${job.external_id}/applications`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          first_name: PROFILE.first_name,
-          last_name: PROFILE.last_name,
-          email: PROFILE.email,
-          phone: PROFILE.phone_formatted,
-          resume_text: resumeText,
-          cover_letter: '',
-          social_media_urls: [{ url: PROFILE.linkedin }],
-          question_answers: [],
-        }),
-      }
-    );
-    if (res.ok) return { success: true, message: 'Submitted via Greenhouse API' };
-    const err = await res.text();
-    return { success: false, message: `Greenhouse API ${res.status}: ${err.slice(0, 200)}` };
-  } catch (e) {
-    return { success: false, message: `Greenhouse API error: ${e.message}` };
+    return { success: false, message: `Greenhouse error: ${err.message}` };
   }
 }
 
@@ -279,46 +269,50 @@ async function submitGreenhouseAPI(job, resumeText) {
 async function submitLever(page, job, resumeText, resumePdfUrl) {
   try {
     const applyUrl = job.url.includes('/apply') ? job.url : `${job.url}/apply`;
+    log(`  🌐 Navigating to: ${applyUrl}`);
     await page.goto(applyUrl, { waitUntil: 'networkidle', timeout: 30000 });
+    await page.waitForTimeout(2000);
+
+    // Detect redirect away from Lever
+    const finalDomain = new URL(page.url()).hostname;
+    if (!finalDomain.includes('lever.co')) {
+      return { success: false, manual: true, message: `Custom career site: ${finalDomain} — apply manually` };
+    }
 
     const answers = job.generated_responses || {};
 
-    // Fill basic fields
     await fillField(page, '[name="name"], #name', PROFILE.full_name);
     await fillField(page, '[name="email"], #email', PROFILE.email);
     await fillField(page, '[name="phone"], #phone', PROFILE.phone_formatted);
-    await fillField(page, '[name="org"], #org', '');
 
-    // LinkedIn
     const linkedinField = await page.$('[name*="linkedin"], [placeholder*="linkedin" i]');
     if (linkedinField) await linkedinField.fill(PROFILE.linkedin);
 
-    // Resume text
     const resumeField = await page.$('textarea[name="resume"], #resume-text');
     if (resumeField) await resumeField.fill(resumeText);
 
-    // Upload resume PDF
     if (resumePdfUrl) {
       await uploadResumePdf(page, resumePdfUrl, 'input[type="file"]');
     }
 
-    // Fill custom questions
     if (answers && typeof answers === 'object') {
       for (const [question, answer] of Object.entries(answers)) {
         await tryFillByLabel(page, question, String(answer));
       }
     }
 
-    // Submit
     await page.click('[type="submit"], .lever-button-black, button[data-qa="btn-submit"]');
     await page.waitForTimeout(3000);
 
     const pageText = await page.textContent('body');
+    log(`  📍 After submit: ${page.url()}`);
+    log(`  📍 Text: ${pageText.slice(0, 200)}`);
+
     if (pageText.match(/thank you|application received|submitted/i)) {
-      return { success: true, message: 'Submitted via Lever form' };
+      return { success: true, message: 'Submitted via Lever form ✓' };
     }
 
-    return { success: true, message: 'Lever form submitted (unconfirmed)' };
+    return { success: false, message: `Lever submitted but no confirmation — ${page.url()}` };
 
   } catch (err) {
     return { success: false, message: `Lever error: ${err.message}` };
@@ -329,37 +323,48 @@ async function submitLever(page, job, resumeText, resumePdfUrl) {
 async function submitAshby(page, job, resumeText, resumePdfUrl) {
   try {
     const applyUrl = job.url.includes('/application') ? job.url : `${job.url}/application`;
+    log(`  🌐 Navigating to: ${applyUrl}`);
     await page.goto(applyUrl, { waitUntil: 'networkidle', timeout: 30000 });
+    await page.waitForTimeout(2000);
+
+    // Detect redirect away from Ashby
+    const finalDomain = new URL(page.url()).hostname;
+    if (!finalDomain.includes('ashbyhq.com')) {
+      return { success: false, manual: true, message: `Custom career site: ${finalDomain} — apply manually` };
+    }
 
     const answers = job.generated_responses || {};
 
-    // Fill basic fields
     await fillField(page, '[name*="firstName"], [placeholder*="First name" i]', PROFILE.first_name);
     await fillField(page, '[name*="lastName"], [placeholder*="Last name" i]', PROFILE.last_name);
     await fillField(page, '[name*="email"], [type="email"]', PROFILE.email);
     await fillField(page, '[name*="phone"], [type="tel"]', PROFILE.phone_formatted);
 
-    // LinkedIn
     const linkedinField = await page.$('[name*="linkedin"], [placeholder*="linkedin" i]');
     if (linkedinField) await linkedinField.fill(PROFILE.linkedin);
 
-    // Upload resume
     if (resumePdfUrl) {
       await uploadResumePdf(page, resumePdfUrl, 'input[type="file"]');
     }
 
-    // Fill custom questions
     if (answers && typeof answers === 'object') {
       for (const [question, answer] of Object.entries(answers)) {
         await tryFillByLabel(page, question, String(answer));
       }
     }
 
-    // Submit
     await page.click('[type="submit"], button:has-text("Submit"), button:has-text("Apply")');
     await page.waitForTimeout(3000);
 
-    return { success: true, message: 'Submitted via Ashby form' };
+    const pageText = await page.textContent('body');
+    log(`  📍 After submit: ${page.url()}`);
+    log(`  📍 Text: ${pageText.slice(0, 200)}`);
+
+    if (pageText.match(/thank you|application received|submitted|success/i)) {
+      return { success: true, message: 'Submitted via Ashby form ✓' };
+    }
+
+    return { success: false, message: `Ashby submitted but no confirmation — ${page.url()}` };
 
   } catch (err) {
     return { success: false, message: `Ashby error: ${err.message}` };
@@ -368,21 +373,17 @@ async function submitAshby(page, job, resumeText, resumePdfUrl) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 async function fillField(page, selector, value) {
-  if (!value) return;
+  if (!value) return false;
   try {
     const el = await page.$(selector);
-    if (el) {
-      await el.fill(value);
-      return true;
-    }
+    if (el) { await el.fill(value); return true; }
   } catch (e) {}
   return false;
 }
 
 async function tryFillByLabel(page, labelText, value) {
-  if (!value || !labelText) return;
+  if (!value || !labelText) return false;
   try {
-    // Find label containing this text
     const labels = await page.$$('label');
     for (const label of labels) {
       const text = await label.textContent();
@@ -410,9 +411,8 @@ async function handleDropdownByLabel(page, labelRegex, value) {
     const selects = await page.$$('select');
     for (const select of selects) {
       const id = await select.getAttribute('id');
-      const name = await select.getAttribute('name');
       const label = await page.$(`label[for="${id}"]`);
-      const labelText = label ? await label.textContent() : (name || '');
+      const labelText = label ? await label.textContent() : '';
       if (labelRegex.test(labelText)) {
         await select.selectOption({ label: value });
         return true;
@@ -426,17 +426,14 @@ async function uploadResumePdf(page, pdfUrl, selector) {
   try {
     const fileInput = await page.$(selector);
     if (!fileInput) return false;
-
-    // Download PDF and create temp file
     const response = await fetch(pdfUrl);
     if (!response.ok) return false;
-
     const buffer = await response.arrayBuffer();
     const tmpPath = `/tmp/resume_${Date.now()}.pdf`;
     fs.writeFileSync(tmpPath, Buffer.from(buffer));
-
     await fileInput.setInputFiles(tmpPath);
     fs.unlinkSync(tmpPath);
+    log(`  📎 Resume uploaded`);
     return true;
   } catch (e) {
     log(`  ⚠ Resume upload failed: ${e.message}`);
@@ -449,7 +446,6 @@ function saveLog() {
   log(`\n📝 Run log saved to run-log.json`);
 }
 
-// ── Run ───────────────────────────────────────────────────────────────────────
 main().catch(err => {
   log(`💥 Fatal error: ${err.message}`);
   runLog.error = err.message;

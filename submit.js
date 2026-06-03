@@ -230,17 +230,30 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl) {
       await uploadResumePdf(page, resumePdfUrl, '[name="job_application[resume]"], input[type="file"][accept*="pdf"]');
     }
 
-    // Submit
-    await page.click('#submit_app, [value="Submit Application"], button[type="submit"]');
-    await page.waitForTimeout(3000);
+// Submit
+await page.click('#submit_app, [value="Submit Application"], button[type="submit"]');
+await page.waitForTimeout(3000);
 
-    // Check for success
-    const pageText = await page.textContent('body');
-    if (pageText.match(/thank you|application received|submitted|we.ll be in touch/i)) {
-      return { success: true, message: 'Submitted via Greenhouse form' };
-    }
+// Take screenshot for debugging
+await page.screenshot({ path: `/tmp/after-submit-${job.external_id}.png` });
 
-    return { success: true, message: 'Form submitted (unconfirmed)' };
+// Log page URL and title
+log(`  📍 After submit URL: ${page.url()}`);
+log(`  📍 Page title: ${await page.title()}`);
+
+// Check for success
+const pageText = await page.textContent('body');
+log(`  📍 Page text snippet: ${pageText.slice(0, 300)}`);
+
+if (pageText.match(/thank you|application received|submitted|we.ll be in touch/i)) {
+  return { success: true, message: 'Submitted via Greenhouse form' };
+}
+
+if (pageText.match(/error|required|invalid|please fill/i)) {
+  return { success: false, message: `Form validation error: ${pageText.slice(0, 200)}` };
+}
+
+return { success: false, message: 'Form submitted but no confirmation detected' };
 
   } catch (err) {
     // Fallback to API

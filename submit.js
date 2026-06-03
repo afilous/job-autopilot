@@ -180,14 +180,21 @@ async function main() {
 // ── Greenhouse ────────────────────────────────────────────────────────────────
 async function submitGreenhouse(page, job, resumeText, resumePdfUrl) {
   try {
-    // Navigate to apply URL
-    const applyUrl = job.url.includes('/apply') ? job.url : `${job.url}/apply`;
-    await page.goto(applyUrl, { waitUntil: 'networkidle', timeout: 30000 });
+    // Navigate to job page
+    await page.goto(job.url, { waitUntil: 'networkidle', timeout: 30000 });
+    await page.waitForTimeout(2000);
+
+    // Click Apply button if present
+    const applyBtn = await page.$('a:has-text("Apply"), button:has-text("Apply"), a[href*="apply"], .apply-button');
+    if (applyBtn) {
+      await applyBtn.click();
+      await page.waitForTimeout(3000);
+    }
 
     // Check if application form exists
-    const formExists = await page.$('#application-form, form[action*="application"], .application-form');
+    const formExists = await page.$('#application-form, form[action*="application"], .application-form, #application');
     if (!formExists) {
-      // Try direct API submission as fallback
+      log(`  ⚠ No form found at ${page.url()} — trying API fallback`);
       return await submitGreenhouseAPI(job, resumeText);
     }
 

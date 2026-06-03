@@ -1,0 +1,15 @@
+{
+  "name": "job-autopilot-scripts",
+  "version": "1.0.0",
+  "description": "Automated job application submission using Playwright",
+  "main": "submit.js",
+  "scripts": {
+    "submit": "node submit.js",
+    "test": "node submit.js --dry-run"
+  },
+  "dependencies": {
+    "@playwright/test": "^1.44.0",
+    "@supabase/supabase-js": "^2.43.0",
+    "playwright": "^1.44.0"
+  }
+}

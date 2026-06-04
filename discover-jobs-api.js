@@ -109,23 +109,43 @@ async function fetchGreenhouseJobs(slug) {
 // ── Fetch Ashby jobs for a slug ───────────────────────────────────────────────
 async function fetchAshbyJobs(slug) {
   try {
-    const url = `https://api.ashbyhq.com/posting-api/job-board/${slug}`;
-    const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+    const url = `https://api.ashbyhq.com/posting-api/job-board/${slug}?includeCompensation=true`;
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(10000),
+      headers: { 'Content-Type': 'application/json' },
+    });
     if (!res.ok) return [];
 
     const data = await res.json();
-    const jobs = data.jobPostings || [];
+
+    // Debug first slug to see actual response shape
+    if (slug === 'ramp') {
+      process.stdout.write(`\n  [Ashby debug] keys: ${Array.isArray(data) ? 'Array' : Object.keys(data).join(', ')}\n`);
+      if (data?.results) process.stdout.write(`  [Ashby debug] results.length: ${data.results.length}\n`);
+      if (data?.jobs) process.stdout.write(`  [Ashby debug] jobs.length: ${data.jobs.length}\n`);
+      if (data?.jobPostings) process.stdout.write(`  [Ashby debug] jobPostings.length: ${data.jobPostings.length}\n`);
+    }
+
+    // Comprehensive fallback — handles all Ashby response formats
+    let jobs = [];
+    if (Array.isArray(data)) {
+      jobs = data;
+    } else if (data && typeof data === 'object') {
+      jobs = data.results || data.jobs || data.jobPostings || data.postings || [];
+    }
+
+    if (!Array.isArray(jobs)) return [];
 
     return jobs
-      .filter(j => isRelevantTitle(j.title) && isRelevantLocation(j.locationName || j.location))
+      .filter(j => isRelevantTitle(j.title) && isRelevantLocation(j.locationName || j.location?.name || j.location))
       .map(j => ({
         job_title: j.title,
         company: data.organization?.name || slug.charAt(0).toUpperCase() + slug.slice(1),
         ats_type: 'ashby',
         ats_slug: slug,
         external_id: j.id,
-        url: `https://jobs.ashbyhq.com/${slug}/${j.id}`,
-        location: j.locationName || j.location || '',
+        url: j.jobUrl || j.applyLink || j.externalLink || `https://jobs.ashbyhq.com/${slug}/${j.id}`,
+        location: j.locationName || j.location?.name || j.location || '',
         source: 'ashby-api',
       }));
   } catch (e) {

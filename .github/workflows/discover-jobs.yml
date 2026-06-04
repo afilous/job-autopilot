@@ -1,0 +1,60 @@
+name: Job Autopilot — Discover Jobs
+
+on:
+  schedule:
+    - cron: '0 14 * * *'  # 2pm UTC = 7am PT daily
+  workflow_dispatch:
+    inputs:
+      method:
+        description: 'Which method to run'
+        required: false
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - api-only
+          - search-only
+
+jobs:
+  discover-api:
+    name: Discover via ATS APIs (free, no key needed)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: ${{ github.event.inputs.method != 'search-only' }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install
+
+      - name: Run API discovery
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: node discover-jobs-api.js
+
+  discover-search:
+    name: Discover via Search APIs (Adzuna + JSearch + SerpApi)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: ${{ github.event.inputs.method != 'api-only' }}
+    needs: discover-api  # run after API discovery so we can compare
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install
+
+      - name: Run search discovery
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
+          ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
+          JSEARCH_API_KEY: ${{ secrets.JSEARCH_API_KEY }}
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+        run: node discover-jobs.js

@@ -1,16 +1,21 @@
 {
-  "name": "job-autopilot-scripts",
+  "name": "job-autopilot",
   "version": "1.0.0",
-  "description": "Automated job application submission using Playwright",
+  "description": "Automated job discovery and application submission",
   "main": "submit.js",
   "scripts": {
+    "discover:api": "node discover-jobs-api.js",
+    "discover:search": "node discover-jobs.js",
     "submit": "node submit.js",
-    "test": "node submit.js --dry-run"
+    "submit:dry": "node submit.js --dry-run"
   },
   "dependencies": {
-    "@playwright/test": "^1.44.0",
-    "@supabase/supabase-js": "^2.43.0",
+    "@supabase/supabase-js": "^2.39.0",
     "playwright": "^1.44.0",
-    "ws": "^8.17.0"
+    "camoufox": "^0.3.9",
+    "node-fetch": "^3.3.2"
+  },
+  "engines": {
+    "node": ">=20.0.0"
   }
 }

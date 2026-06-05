@@ -15,6 +15,9 @@ function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ── Keywords to filter relevant jobs ─────────────────────────────────────────
+// Pre-LLM disqualification filter — removes irrelevant jobs before scoring
+const DISQUALIFIED_TITLE_REGEX = /clinical|nursing|patient|warehouse|fleet|technician|construction|facilities|medical|hospital|it helpdesk|desktop support|field service|field technician|janitorial|maintenance|security guard|driver|delivery/i;
+
 const TITLE_KEYWORDS = [
   // Operations variants
   'operations', 'ops', 'bizops', 'biz ops', 'biz-ops',
@@ -53,6 +56,8 @@ const LOCATION_KEYWORDS = [
 ];
 
 function isRelevantTitle(title) {
+  if (!title) return false;
+  if (DISQUALIFIED_TITLE_REGEX.test(title)) return false;
   const t = title.toLowerCase();
   return TITLE_KEYWORDS.some(k => t.includes(k));
 }
@@ -238,6 +243,53 @@ async function insertJobs(jobs) {
   return newJobs.length;
 }
 
+// ── Discover new company slugs via GitHub code search ────────────────────────
+async function discoverSlugsFromGitHub(token) {
+  if (!token) return { greenhouse: [], ashby: [], lever: [] };
+  const slugs = { greenhouse: new Set(), ashby: new Set(), lever: [] };
+
+  const queries = [
+    { q: 'boards.greenhouse.io in:file', ats: 'greenhouse', regex: /boards\.greenhouse\.io\/([a-zA-Z0-9_-]+)/g },
+    { q: 'jobs.ashbyhq.com in:file', ats: 'ashby', regex: /jobs\.ashbyhq\.com\/([a-zA-Z0-9_-]+)/g },
+    { q: 'jobs.lever.co in:file', ats: 'lever', regex: /jobs\.lever\.co\/([a-zA-Z0-9_-]+)/g },
+  ];
+
+  for (const { q, ats, regex } of queries) {
+    try {
+      const res = await fetch(`https://api.github.com/search/code?q=${encodeURIComponent(q)}&per_page=30`, {
+        headers: {
+          'Authorization': `token ${token}`,
+          'Accept': 'application/vnd.github.v3+json',
+          'User-Agent': 'job-autopilot',
+        },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!res.ok) continue;
+      const data = await res.json();
+      for (const item of (data.items || [])) {
+        const text = item.path + ' ' + (item.repository?.full_name || '');
+        let match;
+        while ((match = regex.exec(text)) !== null) {
+          const slug = match[1].toLowerCase();
+          // Filter out UUIDs and obviously wrong slugs
+          if (slug.length > 2 && slug.length < 40 && !slug.includes('.')) {
+            slugs[ats].add(slug);
+          }
+        }
+      }
+      await new Promise(r => setTimeout(r, 1000)); // Rate limit
+    } catch (e) {}
+  }
+
+  const result = {
+    greenhouse: [...slugs.greenhouse],
+    ashby: [...slugs.ashby],
+    lever: [...slugs.lever],
+  };
+  log(`  GitHub discovery: ${result.greenhouse.length} GH, ${result.ashby.length} Ashby, ${result.lever.length} Lever slugs`);
+  return result;
+}
+
 // ── Fetch YC companies ───────────────────────────────────────────────────────
 async function fetchYCCompanies() {
   try {
@@ -279,7 +331,7 @@ async function fetchYCCompanies() {
 }
 
 // ── Process slugs in parallel batches ────────────────────────────────────────
-async function processBatch(slugs, fetchFn, label) {
+async function processBatch(slugs, fetchFn, label, batchDelay = 300) {
   const CONCURRENCY = 10;
   const allJobs = [];
   let processed = 0;
@@ -303,18 +355,23 @@ async function main() {
   log(`   Ashby:      ${ASHBY_SLUGS.length} companies`);
   log(`   Lever:      ${LEVER_SLUGS.length} companies`);
 
-  // Fetch fresh YC companies and add to slugs
+  // Fetch fresh YC companies
   log('🔍 Fetching YC company job boards...');
   const ycSlugs = await fetchYCCompanies();
-  const allGHSlugs = [...new Set([...GREENHOUSE_SLUGS, ...ycSlugs.greenhouse])];
-  const allABSlugs = [...new Set([...ASHBY_SLUGS, ...ycSlugs.ashby])];
-  const allLVSlugs = [...new Set([...LEVER_SLUGS, ...ycSlugs.lever])];
+
+  // Discover new slugs via GitHub code search (uses GITHUB_TOKEN secret)
+  log('🔍 Discovering new slugs via GitHub code search...');
+  const githubSlugs = await discoverSlugsFromGitHub(process.env.GITHUB_TOKEN);
+
+  const allGHSlugs = [...new Set([...GREENHOUSE_SLUGS, ...ycSlugs.greenhouse, ...githubSlugs.greenhouse])];
+  const allABSlugs = [...new Set([...ASHBY_SLUGS, ...ycSlugs.ashby, ...githubSlugs.ashby])];
+  const allLVSlugs = [...new Set([...LEVER_SLUGS, ...ycSlugs.lever, ...githubSlugs.lever])];
 
   log(`📋 Total companies: ${allGHSlugs.length} GH, ${allABSlugs.length} Ashby, ${allLVSlugs.length} Lever`);
 
   const ghJobs = await processBatch(allGHSlugs, fetchGreenhouseJobs, 'Greenhouse');
-  const abJobs = await processBatch(allABSlugs, fetchAshbyJobs, 'Ashby');
-  const lvJobs = await processBatch(allLVSlugs, fetchLeverJobs, 'Lever');
+  const abJobs = await processBatch(allABSlugs, fetchAshbyJobs, 'Ashby', 1200);
+  const lvJobs = await processBatch(allLVSlugs, fetchLeverJobs, 'Lever', 1000);
 
   const allJobs = [...ghJobs, ...abJobs, ...lvJobs];
 

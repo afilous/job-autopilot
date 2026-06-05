@@ -66,15 +66,18 @@ async function main() {
   const resumePdfUrl = resumeData?.pdf_url || null;
   log(`📄 Resume: ${resumeData?.filename || 'default'}`);
 
-  // Use camoufox for anti-fingerprint stealth (free, fixes navigator.webdriver at C++ layer)
-  // Falls back to standard chromium if camoufox not installed
+  // Use rebrowser-playwright for anti-fingerprint stealth
+  // Patches Chromium at runtime to hide automation signals
   let browser;
   try {
-    const { firefox } = require('camoufox');
-    browser = await firefox.launch({ headless: true });
-    log('🦊 Using Camoufox (stealth mode)');
+    const { chromium: stealthChromium } = require('rebrowser-playwright');
+    browser = await stealthChromium.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    });
+    log('🛡 Using rebrowser-playwright (stealth mode)');
   } catch (e) {
-    log('⚠ Camoufox not available, falling back to Chromium');
+    log('⚠ Stealth browser not available, falling back to standard Chromium');
     browser = await chromium.launch({
       headless: true,
       args: [

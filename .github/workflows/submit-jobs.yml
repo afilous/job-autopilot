@@ -17,7 +17,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
 
       - name: Install dependencies
         run: npm install
@@ -32,10 +32,12 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: node submit.js
 
-      - name: Upload run log
+      - name: Upload run log and debug files
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: submission-log-${{ github.run_id }}
-          path: run-log.json
+          path: |
+            run-log.json
+            /tmp/greenhouse-debug.html
           retention-days: 30

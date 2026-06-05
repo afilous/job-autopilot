@@ -1,0 +1,53 @@
+name: Job Autopilot — Weekly Cleanup
+
+on:
+  schedule:
+    - cron: '0 8 * * 0'  # Every Sunday 8am UTC (midnight PT)
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    name: Clean up old records and update polling tiers
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Run cleanup
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          node -e "
+          const { createClient } = require('@supabase/supabase-js');
+          const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+
+          async function cleanup() {
+            // Delete old archived/duplicate/failed applications
+            const { error: e1, count: c1 } = await supabase
+              .from('applications')
+              .delete()
+              .in('status', ['archived', 'duplicate'])
+              .lt('created_at', new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString());
+            console.log('Deleted old archived/duplicate:', c1, e1?.message);
+
+            // Reset failed jobs for retry (exclude manual companies)
+            const { error: e2, count: c2 } = await supabase
+              .from('applications')
+              .update({ status: 'queued', notes: null })
+              .eq('status', 'failed')
+              .not('company', 'in', '(\"Stripe\",\"Databricks\",\"Block\",\"Intuit\",\"Waymo\")');
+            console.log('Reset failed jobs:', c2, e2?.message);
+
+            // Update polling tiers based on recent activity
+            // Tier 1: posted relevant role in last 30 days → check daily
+            const { error: e3 } = await supabase.rpc('update_polling_tiers').catch(() => ({ error: null }));
+
+            console.log('Cleanup complete');
+          }
+
+          cleanup().catch(console.error);
+          "

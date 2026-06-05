@@ -264,8 +264,12 @@ async function discoverSlugsFromGitHub(token) {
         },
         signal: AbortSignal.timeout(10000),
       });
-      if (!res.ok) continue;
+      if (!res.ok) {
+        log(`  [GitHub] API error ${res.status} for query: ${q}`);
+        continue;
+      }
       const data = await res.json();
+      if (data.message) log(`  [GitHub] API message: ${data.message}`);
       for (const item of (data.items || [])) {
         const text = item.path + ' ' + (item.repository?.full_name || '');
         let match;
@@ -278,7 +282,9 @@ async function discoverSlugsFromGitHub(token) {
         }
       }
       await new Promise(r => setTimeout(r, 1000)); // Rate limit
-    } catch (e) {}
+    } catch (e) {
+      log(`  [GitHub] Exception: ${e.message}`);
+    }
   }
 
   const result = {
@@ -295,22 +301,39 @@ async function fetchYCCompanies() {
   try {
     // YC company directory - returns companies with their job board URLs
     // YC company directory - public API
+    // YC uses a search API — fetch companies from their Algolia search
     const res = await fetch(
-      'https://www.ycombinator.com/companies.json',
-      { 
+      'https://45bwzj1sgc-dsn.algolia.net/1/indexes/*/queries',
+      {
+        method: 'POST',
         signal: AbortSignal.timeout(15000),
-        headers: { 'User-Agent': 'Mozilla/5.0' }
+        headers: {
+          'Content-Type': 'application/json',
+          'x-algolia-application-id': '45BWZJ1SGC',
+          'x-algolia-api-key': 'Zjk5ZmU5OTc4Njc4MGE4MGZlOThjYTM2YTAyYmNhOWFkNWI5MDIxZjczMjM1YWZjNzU4NjA4YTcyYmNlNjQ2NHRhZ0ZpbHRlcnM9JnJlc3RyaWN0SW5kaWNlcz15Y19jb21wYW5pZXM',
+        },
+        body: JSON.stringify({
+          requests: [{
+            indexName: 'yc_companies',
+            params: 'hitsPerPage=1000&filters=batch%3AW25%20OR%20batch%3AS24%20OR%20batch%3AW24%20OR%20batch%3AS23',
+          }]
+        }),
       }
     );
-    if (!res.ok) return { greenhouse: [], ashby: [], lever: [] };
+    if (!res.ok) {
+      log(`  [YC] API error: ${res.status}`);
+      return { greenhouse: [], ashby: [], lever: [] };
+    }
 
     const data = await res.json();
-    const companies = Array.isArray(data) ? data : (data.companies || data.results || []);
+    const companies = data.results?.[0]?.hits || [];
+    log(`  [YC] Found ${companies.length} companies from recent batches`);
     const newSlugs = { greenhouse: [], ashby: [], lever: [] };
 
     for (const company of companies) {
-      const jobsUrl = company.url || '';
-      // Check if their jobs URL points to a known ATS
+      // YC Algolia has jobsUrl or website field
+      const jobsUrl = company.jobsUrl || company.url || company.website || '';
+      if (!jobsUrl) continue;
       if (jobsUrl.includes('boards.greenhouse.io') || jobsUrl.includes('job-boards.greenhouse.io')) {
         const match = jobsUrl.match(/greenhouse\.io\/([^/?]+)/);
         if (match) newSlugs.greenhouse.push(match[1].toLowerCase());

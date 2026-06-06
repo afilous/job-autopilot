@@ -297,12 +297,57 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
       return { success: false, message: `No form found at ${finalUrl}` };
     }
 
-    // Standard fields with human typing
+    // Standard fields — new Greenhouse form uses different IDs
     await humanType(page, '#first_name', PROFILE.first_name);
     await humanType(page, '#last_name', PROFILE.last_name);
     await humanType(page, '#email', PROFILE.email);
     await humanType(page, '#phone', PROFILE.phone_formatted);
-    await humanType(page, '#job_application_location', PROFILE.city);
+
+    // Location — new form uses #candidate-location with autocomplete
+    try {
+      const locField = await page.$('#candidate-location, #job_application_location');
+      if (locField) {
+        await locField.click();
+        await locField.fill('');
+        await page.waitForTimeout(300);
+        await locField.type(PROFILE.city, { delay: 50 });
+        await page.waitForTimeout(800);
+        await page.keyboard.press('ArrowDown');
+        await page.waitForTimeout(300);
+        await page.keyboard.press('Enter');
+        await page.waitForTimeout(300);
+        log(`  ✓ Location: ${PROFILE.city}`);
+      }
+    } catch (e) {
+      log(`  ⚠ Location field: ${e.message}`);
+    }
+
+    // Country — Greenhouse uses reactive autocomplete, must type + ArrowDown + Enter
+    try {
+      const countryField = await page.$('#country, input[id*="country" i]');
+      if (countryField) {
+        await countryField.click();
+        await countryField.fill('');
+        await page.waitForTimeout(300);
+        await countryField.type('United States', { delay: 50 });
+        await page.waitForTimeout(1000); // Wait for dropdown to populate
+        await page.keyboard.press('ArrowDown');
+        await page.waitForTimeout(300);
+        await page.keyboard.press('Enter');
+        await page.waitForTimeout(500);
+        log('  ✓ Country: United States');
+      } else {
+        // Try select dropdown
+        const countrySelect = await page.$('select[id*="country" i]');
+        if (countrySelect) {
+          await countrySelect.selectOption({ label: 'United States' }).catch(() =>
+            countrySelect.selectOption({ value: 'US' }).catch(() => {}));
+          log('  ✓ Country select: United States');
+        }
+      }
+    } catch (e) {
+      log(`  ⚠ Country field: ${e.message}`);
+    }
 
     // LinkedIn
     for (const sel of ['input[name*="linkedin" i]', 'input[id*="linkedin" i]', 'input[placeholder*="linkedin" i]']) {
@@ -318,6 +363,7 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
     let resumeUploaded = false;
     if (resumePdfUrl) {
       resumeUploaded = await uploadResumePdf(page, resumePdfUrl, [
+        'input[type="file"][id="resume"]',
         'input[type="file"][id="resume_file"]',
         'input[type="file"][name="job_application[resume]"]',
         'input[type="file"][accept*="pdf"]',
@@ -354,41 +400,83 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
       if (heardSel) await heardSel.selectOption({ label: 'LinkedIn' }).catch(() => {});
     } catch (e) {}
 
-    // Custom questions via div.field pattern
-    const customFields = await page.$$('div.field');
-    for (const field of customFields) {
-      try {
-        const label = await field.$('label');
-        if (!label) continue;
-        const questionText = await label.innerText();
+    // Handle custom questions - new Greenhouse form uses question_XXXXXXX IDs
+    // Also handle work authorization dropdowns
+    try {
+      // Work authorization - look for select with authorization/sponsorship text nearby
+      const allLabels = await page.$$('label');
+      for (const label of allLabels) {
+        const labelText = (await label.textContent() || '').toLowerCase();
+        const forAttr = await label.getAttribute('for');
+        
+        if (!forAttr) continue;
 
-        const inputEl = await field.$('input[type="text"], input[type="url"], textarea');
-        if (!inputEl) continue;
-
-        const inputId = await inputEl.getAttribute('id') || '';
-        if (['first_name', 'last_name', 'email', 'phone', 'job_application_location'].includes(inputId)) continue;
-
-        // Match against AI-generated answers
-        const answers = job.generated_responses || {};
-        let answer = null;
-        for (const [q, a] of Object.entries(answers)) {
-          if (questionText.toLowerCase().includes(q.toLowerCase().slice(0, 25))) {
-            answer = String(a);
-            break;
+        // Work authorization
+        if (/authoris|authoriz|eligible.*work|work.*authorized/.test(labelText)) {
+          const el = await page.$(`#${CSS.escape(forAttr)}`);
+          if (el) {
+            const tag = await el.evaluate(e => e.tagName.toLowerCase());
+            if (tag === 'select') {
+              await el.selectOption({ label: 'Yes' }).catch(() => 
+                el.selectOption({ value: 'yes' }).catch(() => {}));
+              log('  ✓ Work authorization: Yes');
+            }
           }
         }
 
-        if (answer) {
-          await inputEl.focus();
-          await inputEl.fill('');
-          for (const char of answer.slice(0, 500)) {
-            await page.keyboard.type(char);
-            await page.waitForTimeout(Math.floor(Math.random() * 30 + 8));
+        // Sponsorship
+        if (/sponsor|visa/.test(labelText)) {
+          const el = await page.$(`#${CSS.escape(forAttr)}`);
+          if (el) {
+            const tag = await el.evaluate(e => e.tagName.toLowerCase());
+            if (tag === 'select') {
+              await el.selectOption({ label: 'No' }).catch(() =>
+                el.selectOption({ value: 'no' }).catch(() => {}));
+              log('  ✓ Sponsorship: No');
+            }
           }
-          await page.waitForTimeout(300);
-          log(`  ✓ Custom field: ${questionText.slice(0, 50)}`);
         }
-      } catch (e) {}
+
+        // How did you hear
+        if (/hear about|source|referred/.test(labelText)) {
+          const el = await page.$(`#${CSS.escape(forAttr)}`);
+          if (el) {
+            const tag = await el.evaluate(e => e.tagName.toLowerCase());
+            if (tag === 'select') {
+              await el.selectOption({ label: 'LinkedIn' }).catch(() =>
+                el.selectOption({ index: 1 }).catch(() => {}));
+            }
+          }
+        }
+
+        // Custom text questions (question_XXXXXXX pattern)
+        if (forAttr.startsWith('question_')) {
+          const el = await page.$(`#${CSS.escape(forAttr)}`);
+          if (!el) continue;
+          const tag = await el.evaluate(e => e.tagName.toLowerCase());
+          const type = await el.evaluate(e => e.type || '');
+          
+          if (tag === 'textarea' || (tag === 'input' && !['file', 'hidden', 'radio', 'checkbox'].includes(type))) {
+            // Match against AI answers
+            const answers = job.generated_responses || {};
+            let answer = null;
+            for (const [q, a] of Object.entries(answers)) {
+              if (labelText.includes(q.toLowerCase().slice(0, 20))) {
+                answer = String(a);
+                break;
+              }
+            }
+            // Default answer for unknown questions
+            if (!answer) {
+              answer = PROFILE.summary || 'Please see my resume for details.';
+            }
+            await el.fill(answer.slice(0, 500));
+            log(`  ✓ Custom question: ${labelText.slice(0, 50)}`);
+          }
+        }
+      }
+    } catch (e) {
+      log(`  ⚠ Custom field error: ${e.message}`);
     }
 
     // Submit button — scroll → hover → humanized click
@@ -746,22 +834,48 @@ async function tryFillByLabel(page, labelText, value) {
 // Upload resume PDF from URL
 async function uploadResumePdf(page, pdfUrl, selectors) {
   try {
-    let fileInput = null;
-    for (const sel of selectors) {
-      fileInput = await page.$(sel);
-      if (fileInput) break;
-    }
-    if (!fileInput) return false;
-
+    // Download PDF first
+    log(`  📥 Downloading resume...`);
     const response = await fetch(pdfUrl);
-    if (!response.ok) return false;
+    if (!response.ok) { log(`  ⚠ Resume download failed: ${response.status}`); return false; }
 
     const buffer = await response.arrayBuffer();
-    const tmpPath = `/tmp/resume_${Date.now()}.pdf`;
+    const tmpPath = require('path').resolve('/tmp', 'aaron_resume.pdf');
     fs.writeFileSync(tmpPath, Buffer.from(buffer));
-    await fileInput.setInputFiles(tmpPath);
-    fs.unlinkSync(tmpPath);
-    return true;
+
+    // Verify file exists and has content
+    if (!fs.existsSync(tmpPath) || fs.statSync(tmpPath).size === 0) {
+      log(`  ⚠ Resume file empty or missing at ${tmpPath}`);
+      return false;
+    }
+    log(`  💾 Resume ready: ${fs.statSync(tmpPath).size} bytes at ${tmpPath}`);
+
+    // Try file input directly first
+    for (const sel of selectors) {
+      const fileInput = await page.$(sel);
+      if (fileInput) {
+        log(`  📎 Setting file on input: ${sel}`);
+        await fileInput.setInputFiles(tmpPath);
+        await page.waitForTimeout(1500);
+        log(`  ✅ Resume uploaded via setInputFiles`);
+        return true;
+      }
+    }
+
+    // Fallback: use file chooser event
+    log(`  📎 Trying file chooser approach...`);
+    const fileChooserPromise = page.waitForEvent('filechooser', { timeout: 5000 });
+    await page.click('input[type="file"], [data-automation-id*="resume"], label[for*="resume"]').catch(() => {});
+    const fileChooser = await fileChooserPromise.catch(() => null);
+    if (fileChooser) {
+      await fileChooser.setFiles(tmpPath);
+      await page.waitForTimeout(1500);
+      log(`  ✅ Resume uploaded via file chooser`);
+      return true;
+    }
+
+    log(`  ⚠ No file input found`);
+    return false;
   } catch (e) {
     log(`  ⚠ Resume upload failed: ${e.message}`);
     return false;

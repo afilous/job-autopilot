@@ -300,12 +300,12 @@ function getDropdownAnswer(labelText) {
       c.includes('based in sf') || c.includes('based in san francisco')) return 'San Francisco Bay';
 
   // Priority 7: EEOC/diversity
+  if (c.includes('veteran')) return 'I am not a protected veteran';
+  if (c.includes('disability')) return 'No, I do not have a disability';
   if (c.includes('gender') || c.includes('race') || c.includes('ethnicity') ||
       c.includes('ethnic') || c.includes('sexual orientation') || c.includes('lgbtq') ||
-      c.includes('veteran') || c.includes('disability') || c.includes('transgender') ||
-      c.includes('identify as') || c.includes('identify my')) {
-    if (c.includes('do you have a disability') ||
-        c.includes('voluntary self-identification')) return 'No';
+      c.includes('transgender') || c.includes('identify as') || c.includes('identify my') ||
+      c.includes('lgbtqia') || c.includes('pronoun')) {
     return 'Decline';
   }
 
@@ -597,34 +597,43 @@ linkedin.com/in/aaron-filous`;
               );
             }, forAttr).catch(() => false);
 
-            if (isHiddenBacking) {
+            // For question_ fields with type=text: check if getDropdownAnswer returns an answer
+          // If yes, it's likely a React dropdown — try dropdown approach first, fall back to text
+          const dropdownAnswer = getDropdownAnswer(rawLabel);
+          
+          if (isHiddenBacking || (dropdownAnswer !== null && inputType === 'text')) {
               // This is a React dropdown — find and click the visible trigger
-              const answer = getDropdownAnswer(rawLabel);
+              const answer = dropdownAnswer;
               if (answer !== null) {
                 try {
-                  // Find the visible React dropdown container near the label
+                  // Walk up from label to find the field container
                   const fieldContainer = await label.evaluateHandle(el => {
-                    // Walk up to find the field wrapper div
                     let p = el.parentElement;
-                    for (let i = 0; i < 5; i++) {
+                    for (let i = 0; i < 6; i++) {
                       if (!p) break;
-                      const cls = p.className || '';
-                      if (cls.includes('field') || cls.includes('Field') || p.tagName === 'LI') return p;
+                      const cls = (p.className || '').toString();
+                      // Look for field wrapper — Greenhouse uses various class patterns
+                      if (cls.includes('field') || cls.includes('Field') || 
+                          p.tagName === 'LI' || p.tagName === 'SECTION' ||
+                          (p.children.length > 1 && p.querySelector('label'))) return p;
                       p = p.parentElement;
                     }
                     return el.parentElement;
                   });
 
-                  // Find the visible dropdown trigger in the container
-                  const trigger = await fieldContainer.$('div[class*="css-"], div[class*="select"], div[class*="Select"], [role="combobox"]');
+                  // Find the visible dropdown trigger — Greenhouse uses css- prefixed classes
+                  const trigger = await fieldContainer.$(
+                    '[class*="css-"][class*="container"], [class*="css-"][class*="control"], ' +
+                    '[role="combobox"], div[class*="Select"], div[class*="select__control"]'
+                  ).catch(() => null);
                   
                   if (trigger) {
                     const triggerVisible = await trigger.isVisible().catch(() => false);
                     if (triggerVisible) {
+                      await trigger.scrollIntoViewIfNeeded();
                       await trigger.click({ timeout: 3000 });
-                      await page.waitForTimeout(500);
+                      await page.waitForTimeout(600);
 
-                      // Find options in the opened menu
                       const answer_lower = answer.toLowerCase();
                       const options = await page.$$('[role="option"], [class*="option"], ul[role="listbox"] li');
                       let picked = false;
@@ -632,8 +641,15 @@ linkedin.com/in/aaron-filous`;
                       for (const opt of options) {
                         const optText = (await opt.innerText().catch(() => '')).toLowerCase().trim();
                         if (optText.includes(answer_lower) || 
-                            (answer === 'Decline' && (optText.includes('decline') || optText.includes('not wish') || optText.includes('prefer not'))) ||
-                            (answer === 'San Francisco Bay' && optText.includes('san francisco'))) {
+                            answer_lower.includes(optText.slice(0, 20)) ||
+                            (answer === 'Decline' && (optText.includes('decline') || optText.includes('not wish') || optText.includes('prefer not') || optText.includes('choose not'))) ||
+                            (answer === 'No' && (optText === 'no' || optText.startsWith('no,') || optText.startsWith('no '))) ||
+                            (answer === 'Yes' && (optText === 'yes' || optText.startsWith('yes,') || optText.startsWith('yes '))) ||
+                            (answer === 'California' && optText.includes('california')) ||
+                            (answer === 'San Francisco Bay' && optText.includes('san francisco')) ||
+                            (answer === 'LinkedIn' && optText.includes('linkedin')) ||
+                            (answer === 'I am not a protected veteran' && (optText.includes('not a protected') || optText.includes('not a veteran') || optText.includes('i am not'))) ||
+                            (answer === 'No, I do not have a disability' && (optText.includes('do not have') || optText.includes('no disability') || optText.startsWith('no, i')))) {
                           await opt.click({ timeout: 1500 });
                           picked = true;
                           log('  ✓ React dropdown [' + answer + ']: ' + rawLabel.slice(0, 40));
@@ -641,23 +657,41 @@ linkedin.com/in/aaron-filous`;
                         }
                       }
 
-                      if (!picked) {
-                        // Pick first non-placeholder
+                      if (!picked && options.length > 0) {
                         for (const opt of options) {
                           const optText = (await opt.innerText().catch(() => '')).trim();
-                          if (optText && !optText.toLowerCase().includes('select') && !optText.toLowerCase().includes('not in the us')) {
+                          if (optText && !optText.toLowerCase().includes('select') && 
+                              !optText.toLowerCase().includes('not in the us') &&
+                              !optText.toLowerCase().includes('choose')) {
                             await opt.click({ timeout: 1500 });
                             log('  ✓ React dropdown (first): ' + optText.slice(0, 30));
+                            picked = true;
                             break;
                           }
                         }
                       }
+                      
+                      if (!picked) log('  ⚠ No options found for: ' + rawLabel.slice(0, 30));
                       await page.waitForTimeout(200);
                     } else {
                       log('  ⚠ Trigger not visible: ' + rawLabel.slice(0, 30));
                     }
                   } else {
-                    log('  ⚠ No trigger found: ' + rawLabel.slice(0, 30));
+                    // No trigger found — try clicking the element itself
+                    log('  ⚠ No css- trigger found, trying direct click: ' + rawLabel.slice(0, 30));
+                    try {
+                      await el.click({ timeout: 2000 });
+                      await page.waitForTimeout(400);
+                      const options = await page.$$('[role="option"]');
+                      for (const opt of options) {
+                        const optText = (await opt.innerText().catch(() => '')).toLowerCase().trim();
+                        if (optText.includes(answer.toLowerCase())) {
+                          await opt.click({ timeout: 1500 });
+                          log('  ✓ Direct click dropdown: ' + optText.slice(0, 30));
+                          break;
+                        }
+                      }
+                    } catch(ce) {}
                   }
                 } catch(e) {
                   log('  ⚠ React dropdown error (' + e.message.slice(0, 40) + '): ' + rawLabel.slice(0, 30));
@@ -708,7 +742,9 @@ linkedin.com/in/aaron-filous`;
           const options = await page.$$('[role="option"], ul li, [class*="option"]');
           for (const opt of options) {
             const t = (await opt.innerText().catch(() => '')).toLowerCase();
-            if (t.includes('decline') || t.includes('not wish') || t.includes('prefer not')) {
+            if (t.includes('decline') || t.includes('not wish') || t.includes('prefer not') ||
+                t.includes('choose not') || t.includes('not a protected') || 
+                t.includes('do not have a disability') || t.includes('i am not')) {
               await opt.click();
               log('  ✓ EEOC decline: ' + eeocField);
               break;
@@ -742,10 +778,14 @@ linkedin.com/in/aaron-filous`;
     try {
       const customDropdowns = await page.$$('[role="combobox"], div[class*="select"], .select-wrapper, [aria-haspopup="listbox"]');
       for (const wrapper of customDropdowns) {
-        const isVis = await wrapper.isVisible().catch(() => false);
-        if (!isVis) continue;
-        const wrapperText = (await wrapper.innerText().catch(() => ''));
-        if (!wrapperText.includes('Select...') && !wrapperText.includes('Select…')) continue;
+        try {
+          const isVis = await wrapper.isVisible().catch(() => false);
+          if (!isVis) continue;
+          const wrapperText = await Promise.race([
+            wrapper.innerText(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 1000))
+          ]).catch(() => '');
+          if (!wrapperText.includes('Select...') && !wrapperText.includes('Select…')) continue;
 
         // Detect context from nearby label
         const parentText = await wrapper.evaluate(el => {
@@ -795,6 +835,9 @@ linkedin.com/in/aaron-filous`;
           }
         }
         await page.waitForTimeout(300);
+        } catch(wrapErr) {
+          log('  ⚠ Sweeper element error: ' + wrapErr.message.slice(0, 40));
+        }
       }
     } catch(e) {
       log('  ⚠ Dropdown sweeper: ' + e.message);

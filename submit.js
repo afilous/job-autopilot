@@ -562,33 +562,179 @@ linkedin.com/in/aaron-filous`;
 
         // Custom text questions (question_XXXXXXX pattern)
         if (forAttr.startsWith('question_') || /^\d/.test(forAttr)) {
-          // Always use attribute selector — CSS ID selectors can't start with digits
           const el = await page.$(`[id="${forAttr}"]`);
           if (!el) continue;
+
           const tag = await el.evaluate(e => e.tagName.toLowerCase());
-          const type = await el.evaluate(e => e.type || '');
-          
-          if (tag === 'textarea' || tag === 'select' || (tag === 'input' && !['file', 'hidden', 'radio', 'checkbox'].includes(type))) {
-            // Match against AI answers
-            const answers = job.generated_responses || {};
-            let answer = null;
-            for (const [q, a] of Object.entries(answers)) {
-              if (labelText.includes(q.toLowerCase().slice(0, 20))) {
-                answer = String(a);
-                break;
+          const inputType = await el.evaluate(e => e.type || '');
+
+          // Determine smart answer based on label
+          const labelLower = labelText.toLowerCase();
+          let smartAnswer = null;
+          let isDropdown = false;
+
+          if (/linkedin/i.test(labelLower)) smartAnswer = PROFILE.linkedin;
+          else if (/salary|compensation|pay expectation/i.test(labelLower)) smartAnswer = '145000';
+          else if (/website|portfolio/i.test(labelLower)) smartAnswer = PROFILE.linkedin;
+          else if (/zip|postal/i.test(labelLower)) smartAnswer = '94401';
+          else if (/why.*work|why.*join|why.*interest|what makes you/i.test(labelLower)) smartAnswer = STANDARD_ANSWERS['Why do you want to work here?'];
+          else if (/experience|background|align|describe your/i.test(labelLower)) smartAnswer = STANDARD_ANSWERS['How does your experience align with this role?'];
+          else if (/company|employer|recent/i.test(labelLower)) smartAnswer = 'Enova International';
+          else if (/pronouns/i.test(labelLower)) smartAnswer = 'He/Him';
+
+          // Detect if this is actually a React dropdown (type=text but backed by dropdown)
+          // Check if there's a visible dropdown trigger near this input
+          const isReactDropdown = await page.evaluate((id) => {
+            const el = document.getElementById(id);
+            if (!el) return false;
+            // Check if element or its parent has dropdown indicators
+            const parent = el.closest('div[data-dropdown], div[class*="select"], div[class*="dropdown"], div[class*="Select"]');
+            if (parent) return true;
+            // Check if element is hidden/opacity-0 (backing field for custom component)
+            const style = window.getComputedStyle(el);
+            if (style.opacity === '0' || style.position === 'absolute' || style.visibility === 'hidden') return true;
+            // Check siblings for dropdown indicators
+            const siblings = el.parentElement ? [...el.parentElement.children] : [];
+            return siblings.some(s => s.getAttribute('role') === 'combobox' || 
+              (s.className && (s.className.includes('select') || s.className.includes('dropdown'))));
+          }, forAttr).catch(() => false);
+
+          if (tag === 'select') {
+            // Native select
+            isDropdown = true;
+            let optionToPick = 'Yes';
+            if (/state/i.test(labelLower)) optionToPick = 'California';
+            else if (/hear|source|refer/i.test(labelLower)) optionToPick = 'LinkedIn';
+            else if (/sponsor|visa/i.test(labelLower)) optionToPick = 'No';
+            else if (/gender|race|ethnic|veteran|disability|pronouns|lgbtq|sexual/i.test(labelLower)) optionToPick = 'Decline';
+            else if (/familiar/i.test(labelLower)) optionToPick = null;
+            
+            if (optionToPick) {
+              await el.selectOption({ label: optionToPick }).catch(() =>
+                el.selectOption({ label: optionToPick + ' to self-identify' }).catch(() =>
+                  el.selectOption({ value: optionToPick.toLowerCase() }).catch(() =>
+                    el.selectOption({ index: 1 }).catch(() => {}))));
+            } else {
+              await el.selectOption({ index: 1 }).catch(() => {});
+            }
+            log('  ✓ Native select: ' + labelText.slice(0, 40));
+
+          } else if (isReactDropdown) {
+            // React/custom dropdown — click the visible trigger, then pick option
+            try {
+              // Find the visible clickable element near the hidden input
+              const clickTarget = await page.evaluate((id) => {
+                const el = document.getElementById(id);
+                if (!el) return null;
+                // Try parent chain for clickable dropdown trigger
+                let p = el.parentElement;
+                for (let i = 0; i < 5; i++) {
+                  if (!p) break;
+                  if (p.getAttribute('role') === 'combobox' || 
+                      (p.className && (p.className.includes('select') || p.className.includes('dropdown') || p.className.includes('Select')))) {
+                    return p.id || p.className.split(' ')[0];
+                  }
+                  p = p.parentElement;
+                }
+                return null;
+              }, forAttr).catch(() => null);
+
+              // Click the dropdown trigger
+              await el.scrollIntoViewIfNeeded();
+              await el.click().catch(() => {});
+              await page.waitForTimeout(500);
+
+              // Determine what to pick
+              let pickText = 'Yes';
+              if (/state/i.test(labelLower)) pickText = 'California';
+              else if (/hear|source|refer/i.test(labelLower)) pickText = 'LinkedIn';
+              else if (/sponsor|visa/i.test(labelLower)) pickText = 'No';
+              else if (/gender|race|ethnic|veteran|disability|lgbtq|sexual/i.test(labelLower)) pickText = 'Decline';
+              else if (/metro|based in|relocat|san francisco/i.test(labelLower)) pickText = 'San Francisco';
+              else if (/familiar/i.test(labelLower)) pickText = null; // pick first
+              else if (/sql|experience|years/i.test(labelLower)) pickText = 'Yes';
+              else if (/ai tool|artificial intelligence/i.test(labelLower)) pickText = 'Yes';
+              else if (/previously worked|before/i.test(labelLower)) pickText = 'No';
+              else if (/non.compete|agreement|solicit/i.test(labelLower)) pickText = 'No';
+              else if (/hybrid|in.office|in.person|office/i.test(labelLower)) pickText = 'Yes';
+
+              // Find and click option in the opened dropdown
+              const options = await page.$$('[role="option"], li[class*="option"], ul[role="listbox"] li, .select__option, [class*="menu"] li');
+              let picked = false;
+              if (pickText) {
+                for (const opt of options) {
+                  const optText = (await opt.innerText().catch(() => '')).trim();
+                  if (optText.toLowerCase().includes(pickText.toLowerCase())) {
+                    await opt.click();
+                    picked = true;
+                    log('  ✓ React dropdown: ' + optText.slice(0, 40));
+                    break;
+                  }
+                }
               }
+              if (!picked) {
+                // Pick first non-empty, non-placeholder option
+                for (const opt of options) {
+                  const optText = (await opt.innerText().catch(() => '')).trim();
+                  if (optText && !optText.toLowerCase().includes('select') && !optText.toLowerCase().includes('choose') && !optText.toLowerCase().includes('not in the us')) {
+                    await opt.click();
+                    log('  ✓ React dropdown (first): ' + optText.slice(0, 40));
+                    break;
+                  }
+                }
+              }
+              await page.waitForTimeout(300);
+            } catch(e) {
+              log('  ⚠ React dropdown error: ' + e.message.slice(0, 60));
             }
-            // Default answer for unknown questions
-            if (!answer) {
-              answer = PROFILE.summary || 'Please see my resume for details.';
+
+          } else if (tag === 'textarea' || (tag === 'input' && !['file','hidden','radio','checkbox'].includes(inputType))) {
+            // Regular text input
+            if (!smartAnswer) {
+              const answers = job.generated_responses || {};
+              for (const [q, a] of Object.entries(answers)) {
+                if (labelLower.includes(q.toLowerCase().slice(0, 20))) { smartAnswer = String(a); break; }
+              }
+              if (!smartAnswer) smartAnswer = 'Please see my attached resume for details.';
             }
-            await el.fill(answer.slice(0, 500));
-            log(`  ✓ Custom question: ${labelText.slice(0, 50)}`);
+            await el.fill(smartAnswer.slice(0, 500));
+            log('  ✓ Custom text: ' + labelText.slice(0, 50));
           }
         }
       }
     } catch (e) {
       log(`  ⚠ Custom field error: ${e.message}`);
+    }
+
+    // EEOC fields by known IDs (Verkada pattern)
+    for (const eeocField of ['gender','hispanic_ethnicity','veteran_status','disability_status']) {
+      try {
+        const el = await page.$(`[id="${eeocField}"]`);
+        if (!el) continue;
+        const tag = await el.evaluate(e => e.tagName.toLowerCase());
+        if (tag === 'select') {
+          await el.selectOption({ index: 1 }).catch(() => {});
+          log('  ✓ EEOC select: ' + eeocField);
+        } else {
+          // React dropdown
+          await el.click().catch(() => {});
+          await page.waitForTimeout(400);
+          const options = await page.$$('[role="option"], ul li, [class*="option"]');
+          for (const opt of options) {
+            const t = (await opt.innerText().catch(() => '')).toLowerCase();
+            if (t.includes('decline') || t.includes('not wish') || t.includes('prefer not')) {
+              await opt.click();
+              log('  ✓ EEOC decline: ' + eeocField);
+              break;
+            }
+          }
+          // Fallback: pick first option
+          if (options.length > 0) {
+            await options[0].click().catch(() => {});
+          }
+          await page.waitForTimeout(300);
+        }
+      } catch(e) {}
     }
 
     // EEOC / Diversity self-identification — decline all to avoid missing field errors
@@ -605,6 +751,65 @@ linkedin.com/in/aaron-filous`;
         }
       }
     } catch(e) {}
+
+    // Universal React/custom dropdown sweeper — catches any remaining "Select..." placeholders
+    try {
+      const customDropdowns = await page.$$('[role="combobox"], div[class*="select"], .select-wrapper, [aria-haspopup="listbox"]');
+      for (const wrapper of customDropdowns) {
+        const wrapperText = (await wrapper.innerText().catch(() => ''));
+        if (!wrapperText.includes('Select...') && !wrapperText.includes('Select…')) continue;
+
+        // Detect context from nearby label
+        const parentText = await wrapper.evaluate(el => {
+          let p = el.parentElement;
+          for (let i = 0; i < 4; i++) {
+            if (p) { if (p.textContent) return p.textContent.toLowerCase(); p = p.parentElement; }
+          }
+          return '';
+        }).catch(() => '');
+
+        await wrapper.scrollIntoViewIfNeeded();
+        await wrapper.click();
+        await page.waitForTimeout(600);
+
+        // Pick option based on context
+        const options = await page.$$('[role="option"], li[class*="option"], .select-option, option');
+        let picked = false;
+        for (const opt of options) {
+          const optText = (await opt.innerText().catch(() => '')).trim().toLowerCase();
+          if (!optText || optText.includes('select') || optText.includes('choose')) continue;
+
+          // Context-aware selection
+          if (/sponsor|visa/.test(parentText) && optText === 'no') {
+            await opt.click(); picked = true; log('  ✓ Sweeper: No (sponsorship)'); break;
+          }
+          if (/gender|race|ethnic|veteran|disability|pronouns/.test(parentText) && optText.includes('decline')) {
+            await opt.click(); picked = true; log('  ✓ Sweeper: Decline (EEOC)'); break;
+          }
+          if (/hear|source|refer/.test(parentText) && optText.includes('linkedin')) {
+            await opt.click(); picked = true; log('  ✓ Sweeper: LinkedIn (source)'); break;
+          }
+          if (/state/.test(parentText) && optText.includes('california')) {
+            await opt.click(); picked = true; log('  ✓ Sweeper: California (state)'); break;
+          }
+        }
+
+        // Fallback: pick first non-placeholder option
+        if (!picked) {
+          for (const opt of options) {
+            const optText = (await opt.innerText().catch(() => '')).trim();
+            if (optText && !optText.toLowerCase().includes('select') && !optText.toLowerCase().includes('choose') && !optText.toLowerCase().includes('not in the us')) {
+              await opt.click();
+              log('  ✓ Sweeper: ' + optText.slice(0, 40) + ' (first option)');
+              break;
+            }
+          }
+        }
+        await page.waitForTimeout(300);
+      }
+    } catch(e) {
+      log('  ⚠ Dropdown sweeper: ' + e.message);
+    }
 
     // Submit button — scroll → hover → humanized click
     const submitBtn = page.locator('#submit_app, input[type="submit"][value*="Submit" i], button[type="submit"]').first();

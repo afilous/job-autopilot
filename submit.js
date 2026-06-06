@@ -263,8 +263,15 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
     const applyUrl = `https://boards.greenhouse.io/${slug}/jobs/${jobId}?gh_jid=${jobId}#app`;
 
     log(`  🌐 ${applyUrl}`);
-    await page.goto(applyUrl, { waitUntil: 'networkidle', timeout: 30000 });
-    await page.waitForTimeout(2000);
+    await page.goto(applyUrl, { waitUntil: 'load', timeout: 30000 });
+    
+    // Wait for React to fully hydrate
+    try {
+      await page.waitForSelector('#first_name, input[name="job_application[first_name]"], input[placeholder*="First" i]', { state: 'visible', timeout: 15000 });
+    } catch (e) {
+      log(`  ⚠ Form fields not found after 15s — checking page state`);
+    }
+    await page.waitForTimeout(3000); // Extra hydration buffer
 
     const finalUrl = page.url();
     const finalDomain = new URL(finalUrl).hostname;
@@ -272,11 +279,21 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
       return { success: false, manual: true, message: `Custom site: ${finalDomain}` };
     }
 
+    // Save debug HTML to understand form structure
+    const debugHtml = await page.content();
+    fs.writeFileSync('/tmp/greenhouse-debug.html', debugHtml.slice(0, 100000));
+    log(`  📄 Debug HTML saved (${debugHtml.length} chars)`);
+
+    // Check what form fields actually exist
+    const fieldIds = await page.evaluate(() => {
+      const inputs = document.querySelectorAll('input, textarea, select');
+      return [...inputs].map(el => ({ id: el.id, name: el.name, type: el.type, placeholder: el.placeholder })).filter(el => el.id || el.name);
+    });
+    log(`  📋 Form fields found: ${JSON.stringify(fieldIds.slice(0, 15))}`);
+
     // Check form exists
-    const formExists = await page.$('form, #application-form, .application-form');
+    const formExists = await page.$('form, #application-form, .application-form, #main_fields');
     if (!formExists) {
-      const html = await page.content();
-      fs.writeFileSync('/tmp/greenhouse-debug.html', html.slice(0, 50000));
       return { success: false, message: `No form found at ${finalUrl}` };
     }
 
@@ -298,18 +315,28 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
     }
 
     // Upload resume PDF
+    let resumeUploaded = false;
     if (resumePdfUrl) {
-      const uploaded = await uploadResumePdf(page, resumePdfUrl, [
+      resumeUploaded = await uploadResumePdf(page, resumePdfUrl, [
         'input[type="file"][id="resume_file"]',
         'input[type="file"][name="job_application[resume]"]',
         'input[type="file"][accept*="pdf"]',
         'input[type="file"]',
       ]);
-      if (uploaded) log(`  📎 Resume uploaded`);
+      if (resumeUploaded) log(`  📎 Resume PDF uploaded`);
+      else log(`  ⚠ Resume PDF upload failed — falling back to text`);
+    } else {
+      log(`  ⚠ No resume PDF URL — using text fallback`);
     }
 
-    // Resume text fallback
-    await fillField(page, ['#resume_text', 'textarea[name="job_application[resume_text]"]'], resumeText.slice(0, 5000));
+    // Resume text — always fill as fallback
+    const resumeTextFilled = await fillField(page, [
+      '#resume_text',
+      'textarea[name="job_application[resume_text]"]',
+      'textarea[id*="resume"]',
+    ], resumeText.slice(0, 5000));
+    if (resumeTextFilled) log(`  📝 Resume text filled`);
+    else if (!resumeUploaded) log(`  ❌ Neither PDF nor text resume could be filled — submission will likely fail`);
 
     await page.waitForTimeout(Math.floor(Math.random() * 800 + 400));
 
@@ -417,6 +444,17 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
     if (afterUrl.includes('confirmation')) {
       return { success: true, message: `Submitted via Greenhouse ✓ (URL)` };
     }
+    // Extract specific validation errors
+    const validationErrors = await page.evaluate(() => {
+      const errors = document.querySelectorAll('.error, .field-error, [class*="error"], [class*="invalid"]');
+      return [...errors].map(el => el.textContent?.trim()).filter(t => t && t.length > 0).slice(0, 10);
+    }).catch(() => []);
+    
+    if (validationErrors.length > 0) {
+      log(`  📋 Validation errors: ${validationErrors.join(' | ')}`);
+      return { success: false, message: `Validation: ${validationErrors.slice(0, 3).join(', ')}` };
+    }
+    
     if (pageText.match(/error|required|invalid|can.t be blank/i)) {
       return { success: false, message: `Validation error` };
     }

@@ -300,6 +300,7 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
     // Standard fields — new Greenhouse form uses different IDs
     await humanType(page, '#first_name', PROFILE.first_name);
     await humanType(page, '#last_name', PROFILE.last_name);
+    await humanType(page, '#preferred_name', PROFILE.first_name); // some boards require this
     await humanType(page, '#email', PROFILE.email);
     await humanType(page, '#phone', PROFILE.phone_formatted);
 
@@ -349,9 +350,15 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
       log(`  ⚠ Country field: ${e.message}`);
     }
 
-    // LinkedIn
-    for (const sel of ['input[name*="linkedin" i]', 'input[id*="linkedin" i]', 'input[placeholder*="linkedin" i]']) {
-      if (await humanType(page, sel, PROFILE.linkedin)) break;
+    // LinkedIn — try multiple patterns
+    for (const sel of [
+      'input[name*="linkedin" i]', 
+      'input[id*="linkedin" i]', 
+      'input[placeholder*="linkedin" i]',
+      'input[id*="LinkedIn"]',
+      '[id="question_linkedin"]',
+    ]) {
+      if (await humanType(page, sel, PROFILE.linkedin)) { log('  ✓ LinkedIn filled'); break; }
     }
 
     // Website
@@ -413,7 +420,7 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
 
         // Work authorization
         if (/authoris|authoriz|eligible.*work|work.*authorized/.test(labelText)) {
-          const el = await page.$(`#${CSS.escape(forAttr)}`);
+          const el = await page.$(`[id="${forAttr}"]`);
           if (el) {
             const tag = await el.evaluate(e => e.tagName.toLowerCase());
             if (tag === 'select') {
@@ -426,7 +433,7 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
 
         // Sponsorship
         if (/sponsor|visa/.test(labelText)) {
-          const el = await page.$(`#${CSS.escape(forAttr)}`);
+          const el = await page.$(`[id="${forAttr}"]`);
           if (el) {
             const tag = await el.evaluate(e => e.tagName.toLowerCase());
             if (tag === 'select') {
@@ -437,9 +444,33 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
           }
         }
 
+        // Currently in US / willing to relocate
+        if (/currently.*located|currently.*us|located in the us/i.test(labelText)) {
+          const el = await page.$(`[id="${forAttr}"]`);
+          if (el) {
+            const tag = await el.evaluate(e => e.tagName.toLowerCase());
+            if (tag === 'select') {
+              await el.selectOption({ label: 'Yes' }).catch(() => el.selectOption({ index: 1 }).catch(() => {}));
+              log('  ✓ Currently in US: Yes');
+            }
+          }
+        }
+
+        // Willing to relocate / work in office
+        if (/willing to.*relocate|willing to work|work out of/i.test(labelText)) {
+          const el = await page.$(`[id="${forAttr}"]`);
+          if (el) {
+            const tag = await el.evaluate(e => e.tagName.toLowerCase());
+            if (tag === 'select') {
+              await el.selectOption({ label: 'Yes' }).catch(() => el.selectOption({ index: 1 }).catch(() => {}));
+              log('  ✓ Willing to work/relocate: Yes');
+            }
+          }
+        }
+
         // How did you hear
         if (/hear about|source|referred/.test(labelText)) {
-          const el = await page.$(`#${CSS.escape(forAttr)}`);
+          const el = await page.$(`[id="${forAttr}"]`);
           if (el) {
             const tag = await el.evaluate(e => e.tagName.toLowerCase());
             if (tag === 'select') {
@@ -450,13 +481,14 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
         }
 
         // Custom text questions (question_XXXXXXX pattern)
-        if (forAttr.startsWith('question_')) {
-          const el = await page.$(`#${CSS.escape(forAttr)}`);
+        if (forAttr.startsWith('question_') || /^\d/.test(forAttr)) {
+          const safeId = forAttr.replace(/(:|\.|\[|\]|,|=|@)/g, '\\$1');
+          const el = await page.$(`#${safeId}`) || await page.$(`[id="${forAttr}"]`);
           if (!el) continue;
           const tag = await el.evaluate(e => e.tagName.toLowerCase());
           const type = await el.evaluate(e => e.type || '');
           
-          if (tag === 'textarea' || (tag === 'input' && !['file', 'hidden', 'radio', 'checkbox'].includes(type))) {
+          if (tag === 'textarea' || tag === 'select' || (tag === 'input' && !['file', 'hidden', 'radio', 'checkbox'].includes(type))) {
             // Match against AI answers
             const answers = job.generated_responses || {};
             let answer = null;
@@ -540,6 +572,24 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
     
     if (validationErrors.length > 0) {
       log(`  📋 Validation errors: ${validationErrors.join(' | ')}`);
+      
+      // Check if failures are due to custom questions we couldn't answer
+      const isCustomQuestionFailure = validationErrors.some(e => 
+        e.match(/why do you|tell us|describe|what is your|how did you hear|willing to|authorized|currently located/i)
+      );
+      
+      if (isCustomQuestionFailure) {
+        // Save missing questions to DB for later review
+        const missingQs = validationErrors.filter(e => 
+          e.match(/why do you|tell us|describe|what is your/i)
+        ).join(' | ');
+        return { 
+          success: false, 
+          needs_custom: true,
+          message: `Needs custom answers: ${missingQs.slice(0, 200)}` 
+        };
+      }
+      
       return { success: false, message: `Validation: ${validationErrors.slice(0, 3).join(', ')}` };
     }
     
@@ -811,7 +861,8 @@ async function tryFillByLabel(page, labelText, value) {
       if (text && text.toLowerCase().includes(labelText.toLowerCase().slice(0, 25))) {
         const forAttr = await label.getAttribute('for');
         if (forAttr) {
-          const input = await page.$(`#${CSS.escape(forAttr)}`);
+          const safeForId = forAttr.replace(/(:|\.|\[|\]|,|=|@)/g, '\\$1');
+        const input = await page.$(`#${safeForId}`) || await page.$(`[id="${forAttr}"]`);
           if (input) {
             const tag = await input.evaluate(el => el.tagName.toLowerCase());
             const type = await input.evaluate(el => el.type || '');

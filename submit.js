@@ -353,9 +353,11 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
       const knownCustomSites = ['fivetran.com', 'airbnb.com', 'okta.com', 'lyft.com',
         'pinterestcareers.com', 'careerpuck.com', 'samsara.com', 'databricks.com'];
       if (knownCustomSites.some(s => finalDomain.includes(s))) {
-        await supabase.from('companies')
-          .update({ active: false, notes: 'custom career site — cannot automate' })
-          .eq('ats_slug', job.ats_slug).catch(() => {});
+        try {
+          await supabase.from('companies')
+            .update({ active: false, notes: 'custom career site — cannot automate' })
+            .eq('ats_slug', job.ats_slug);
+        } catch(e) {}
         log(`  📋 Deactivated custom-site company: ${job.company}`);
       }
       return { success: false, manual: true, message: `Custom site: ${finalDomain}` };
@@ -774,74 +776,8 @@ linkedin.com/in/aaron-filous`;
       }
     } catch(e) {}
 
-    // Universal React/custom dropdown sweeper — catches any remaining "Select..." placeholders
-    try {
-      const customDropdowns = await page.$$('[role="combobox"], div[class*="select"], .select-wrapper, [aria-haspopup="listbox"]');
-      for (const wrapper of customDropdowns) {
-        try {
-          const isVis = await wrapper.isVisible().catch(() => false);
-          if (!isVis) continue;
-          const wrapperText = await Promise.race([
-            wrapper.innerText(),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 1000))
-          ]).catch(() => '');
-          if (!wrapperText.includes('Select...') && !wrapperText.includes('Select…')) continue;
+    // Sweeper disabled — was causing 4+ minute hangs on invisible elements
 
-        // Detect context from nearby label
-        const parentText = await wrapper.evaluate(el => {
-          let p = el.parentElement;
-          for (let i = 0; i < 4; i++) {
-            if (p) { if (p.textContent) return p.textContent.toLowerCase(); p = p.parentElement; }
-          }
-          return '';
-        }).catch(() => '');
-
-        await wrapper.scrollIntoViewIfNeeded().catch(() => {});
-        const clicked = await wrapper.click({ timeout: 2000 }).then(() => true).catch(() => false);
-        if (!clicked) continue;
-        await page.waitForTimeout(500);
-
-        // Pick option based on context
-        const options = await page.$$('[role="option"], li[class*="option"], .select-option, option');
-        let picked = false;
-        for (const opt of options) {
-          const optText = (await opt.innerText().catch(() => '')).trim().toLowerCase();
-          if (!optText || optText.includes('select') || optText.includes('choose')) continue;
-
-          // Context-aware selection
-          if (/sponsor|visa/.test(parentText) && optText === 'no') {
-            await opt.click(); picked = true; log('  ✓ Sweeper: No (sponsorship)'); break;
-          }
-          if (/gender|race|ethnic|veteran|disability|pronouns/.test(parentText) && optText.includes('decline')) {
-            await opt.click(); picked = true; log('  ✓ Sweeper: Decline (EEOC)'); break;
-          }
-          if (/hear|source|refer/.test(parentText) && optText.includes('linkedin')) {
-            await opt.click(); picked = true; log('  ✓ Sweeper: LinkedIn (source)'); break;
-          }
-          if (/state/.test(parentText) && optText.includes('california')) {
-            await opt.click(); picked = true; log('  ✓ Sweeper: California (state)'); break;
-          }
-        }
-
-        // Fallback: pick first non-placeholder option
-        if (!picked) {
-          for (const opt of options) {
-            const optText = (await opt.innerText().catch(() => '')).trim();
-            if (optText && !optText.toLowerCase().includes('select') && !optText.toLowerCase().includes('choose') && !optText.toLowerCase().includes('not in the us')) {
-              await opt.click();
-              log('  ✓ Sweeper: ' + optText.slice(0, 40) + ' (first option)');
-              break;
-            }
-          }
-        }
-        await page.waitForTimeout(300);
-        } catch(wrapErr) {
-          log('  ⚠ Sweeper element error: ' + wrapErr.message.slice(0, 40));
-        }
-      }
-    } catch(e) {
-      log('  ⚠ Dropdown sweeper: ' + e.message);
-    }
 
     // Submit button — scroll → hover → humanized click
     const submitBtn = page.locator('#submit_app, input[type="submit"][value*="Submit" i], button[type="submit"]').first();
@@ -1082,6 +1018,14 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
       }),
     ]).catch(() => null);
 
+    // Listen for network submission response BEFORE clicking
+    const networkPromise = page.waitForResponse(resp => {
+      const url = resp.url();
+      return url.includes('ashbyhq.com') && 
+             (url.includes('/application') || url.includes('/apply') || url.includes('/submit')) &&
+             resp.request().method() === 'POST';
+    }, { timeout: 15000 }).catch(() => null);
+
     const ashbyBtn = page.locator('[type="submit"], button:has-text("Submit"), button:has-text("Apply")').first();
     if (await ashbyBtn.count() > 0) {
       await ashbyBtn.scrollIntoViewIfNeeded();
@@ -1090,16 +1034,39 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
       await ashbyBtn.click({ delay: Math.floor(Math.random() * 100 + 50) });
     }
 
+    // Check network response
+    const networkResp = await networkPromise;
+    if (networkResp) {
+      const status = networkResp.status();
+      log(`  📡 Network response: ${status} from ${networkResp.url().slice(0, 60)}`);
+      if (status >= 400) {
+        return { success: false, message: `Ashby server rejected: ${status}` };
+      }
+    }
+
     const ashbyResult = await ashbyPromise;
     const ashbyUrl = page.url();
-    const ashbyText = await page.textContent('body').catch(() => '');
     log(`  📍 ${ashbyUrl}`);
 
-    if (ashbyResult || ashbyUrl.includes('/application/success')) {
+    // STRICT confirmation — must navigate to /application/success or /thanks
+    if (ashbyResult || ashbyUrl.includes('/application/success') || ashbyUrl.includes('/thanks')) {
       return { success: true, message: `Submitted via Ashby ✓` };
     }
-    if (ashbyText.match(/thank you|application received|submitted|success/i)) {
+
+    // Check body text ONLY for very specific confirmation phrases — not generic words like "submit" or "success"
+    const ashbyText = await page.textContent('body').catch(() => '');
+    if (ashbyText.match(/your application was successfully submitted|application received|thank you for applying/i)) {
       return { success: true, message: 'Submitted via Ashby ✓ (DOM)' };
+    }
+
+    // Still on /application — submission did not complete
+    log(`  ⚠ Still on /application page — form may not have submitted`);
+    
+    // Check for validation errors
+    const ashbyErrors = await page.$$('[class*="error"], [class*="invalid"], [aria-invalid="true"]');
+    if (ashbyErrors.length > 0) {
+      const errTexts = await Promise.all(ashbyErrors.map(e => e.textContent().catch(() => '')));
+      log(`  📋 Ashby validation errors: ${errTexts.filter(Boolean).slice(0,3).join(' | ')}`);
     }
 
     await page.screenshot({ path: '/tmp/ashby-debug.png', fullPage: true }).catch(() => {});

@@ -1,1244 +1,567 @@
-/**
- * Job Autopilot — Automated Application Submission
- * Incorporates all Gemini insights and confirmed ATS mechanics
- */
-
-const { chromium } = require('playwright');
-const { createClient } = require('@supabase/supabase-js');
-const fs = require('fs');
-
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
-const PROXY_URL = process.env.PROXY_URL || null;
-const DRY_RUN = process.argv.includes('--dry-run');
-const MAX_SUBMISSIONS = 10;
-const MIN_SCORE = 75;
-const DELAY_BETWEEN_MS = () => 12000 + Math.random() * 8000;
-
-// Resume variants — add more URLs to Supabase storage as they become available
-// Gemini scorer sets resume_variant column; we pick the right PDF here
-const RESUME_VARIANTS = {
-  fintech: null,       // future: 'https://...supabase.../resume_fintech.pdf'
-  early_stage: null,  // future: 'https://...supabase.../resume_early_stage.pdf'
-  default: null,      // loaded from Supabase resumes table at runtime
-};
-
-const PROFILE = {
-  full_name: 'Aaron Filous',
-  first_name: 'Aaron',
-  last_name: 'Filous',
-  email: 'filousaaron@gmail.com',
-  phone: '6502913142',
-  phone_formatted: '(650) 291-3142',
-  linkedin: 'https://www.linkedin.com/in/aaron-filous/',
-  location: 'San Mateo, CA',
-  city: 'San Mateo',
-  state: 'CA',
-  zip: '94401',
-  country: 'United States',
-  website: 'https://www.linkedin.com/in/aaron-filous/',
-  heard_about: 'LinkedIn',
-  authorized_to_work: 'Yes',
-  requires_sponsorship: 'No',
-  salary_expectation: '145000',
-};
-
-// Dynamic answer focus rotation — keeps AI answers feeling fresh
-const FOCUS_ELEMENTS = [
-  'Quantitative scale metrics',
-  'Cross-functional team execution',
-  'Operational framework construction',
-  'Revenue efficiency',
-];
-
-// Companies that use custom career sites — skip automation
-const MANUAL_COMPANIES = ['Stripe', 'Databricks', 'Block', 'Intuit', 'Waymo'];
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-const runLog = { started_at: new Date().toISOString(), dry_run: DRY_RUN, results: [] };
-
-function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-function randomFocus() { return FOCUS_ELEMENTS[Math.floor(Math.random() * FOCUS_ELEMENTS.length)]; }
-
-// ── Main ──────────────────────────────────────────────────────────────────────
-async function main() {
-  log(DRY_RUN ? '🔍 DRY RUN mode' : '🚀 Starting job submission run');
-
-  // Recovery: release any jobs stuck in 'processing' for more than 30 minutes
-  // This happens when GitHub Actions crashes or times out mid-run
-  const staleWindow = new Date(Date.now() - 30 * 60 * 1000).toISOString();
-  const { error: rollbackError, count: rollbackCount } = await supabase
-    .from('applications')
-    .update({ status: 'queued', notes: 'Auto-recovered from stale processing state' })
-    .eq('status', 'processing')
-    .lt('started_at', staleWindow);
-  if (!rollbackError && rollbackCount > 0) log('♻ Recovered ' + rollbackCount + ' stale jobs back to queued');
-
-  // Fetch queued jobs
-  const { data: jobs, error } = await supabase
-    .from('applications')
-    .select('*')
-    .eq('status', 'queued')
-    .not('generated_responses', 'is', null)
-    .in('ats_type', ['greenhouse', 'lever', 'ashby'])
-    .gte('match_score', MIN_SCORE)
-    .not('company', 'in', `(${MANUAL_COMPANIES.map(c => `"${c}"`).join(',')})`)
-    .order('match_score', { ascending: false })
-    .limit(MAX_SUBMISSIONS);
-
-  if (error) { log(`❌ Failed to fetch jobs: ${error.message}`); process.exit(1); }
-  if (!jobs || jobs.length === 0) { log('✅ No jobs queued — nothing to submit'); saveLog(); return; }
-
-  log(`📋 Found ${jobs.length} jobs to submit (min score: ${MIN_SCORE}%)`);
-
-  // Load active resume
-  const { data: resumeData } = await supabase
-    .from('resumes').select('*').eq('is_active', true).limit(1).single();
-
-  const resumeText = resumeData?.raw_text || '';
-  RESUME_VARIANTS.default = resumeData?.pdf_url || null;
-  log(`📄 Resume: ${resumeData?.filename || 'default'}`);
-
-  const browser = await chromium.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-blink-features=AutomationControlled',
-      '--disable-dev-shm-usage',
-      '--disable-infobars',
-    ],
-  });
-
-  let submitted = 0, failed = 0, manual = 0, skipped = 0, duplicate = 0;
-
-  for (let i = 0; i < jobs.length; i++) {
-    const job = jobs[i];
-    log(`\n[${i + 1}/${jobs.length}] ${job.job_title} at ${job.company} (${job.ats_type})`);
-    log(`  Score: ${job.match_score}% | Variant: ${job.resume_variant || 'default'}`);
-
-    // Pre-flight HEAD check — skip dead URLs before spinning up browser
-    try {
-      const check = await fetch(job.url, {
-        method: 'HEAD',
-        redirect: 'manual',
-        signal: AbortSignal.timeout(5000),
-      });
-      if ([404, 410].includes(check.status)) {
-        log(`  ⚰ Job gone (${check.status}) — archiving`);
-        await supabase.from('applications').update({ status: 'archived', notes: `HTTP ${check.status}` }).eq('id', job.id);
-        skipped++;
-        continue;
-      }
-      // Lever returns 302 for dead jobs — check if redirecting to parent slug (no job ID in redirect)
-      if ([301, 302].includes(check.status) && job.ats_type === 'lever') {
-        const loc = check.headers.get('location') || '';
-        if (!loc.includes(job.external_id)) {
-          log(`  ⚰ Lever job redirected away — archiving`);
-          await supabase.from('applications').update({ status: 'archived', notes: 'Lever 302 redirect' }).eq('id', job.id);
-          skipped++;
-          continue;
-        }
-      }
-    } catch (e) {
-      log(`  ⚠ Pre-flight failed: ${e.message} — continuing`);
-    }
-
-    if (DRY_RUN) {
-      log('  ⏭ DRY RUN — skipping');
-      runLog.results.push({ job_id: job.id, status: 'dry_run' });
-      skipped++;
-      continue;
-    }
-
-    // Idempotency guard — atomically claim the record
-    const { data: claimed } = await supabase
-      .from('applications')
-      .update({ status: 'processing', started_at: new Date().toISOString() })
-      .eq('id', job.id)
-      .eq('status', 'queued')
-      .select();
-
-    if (!claimed || claimed.length === 0) {
-      log(`  ⏭ Already claimed by another run — skipping`);
-      skipped++;
-      continue;
-    }
-
-    // Pick resume variant
-    const variantKey = job.resume_variant || 'default';
-    const resumePdfUrl = RESUME_VARIANTS[variantKey] || RESUME_VARIANTS.default;
-
-    const context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      viewport: { width: 1440, height: 900 },
-      deviceScaleFactor: 2,
-      hasTouch: false,
-      locale: 'en-US',
-      timezoneId: 'America/Los_Angeles',
-      extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
-      ...(PROXY_URL ? { proxy: { server: PROXY_URL } } : {}),
-    });
-
-    const page = await context.newPage();
-
-    // Full Mac Chrome spoofing
-    await page.addInitScript(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-      window.chrome = { runtime: {} };
-      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-    });
-
-    // Wire browser console errors to our logs
-    page.on('console', msg => { if (msg.type() === 'error') log(`  🖥 ${msg.text()}`); });
-    page.on('pageerror', err => log(`  🖥 JS error: ${err.message}`));
-
-    try {
-      let result;
-      const focus = randomFocus();
-      log(`  🎯 Answer focus: ${focus}`);
-
-      if (job.ats_type === 'greenhouse') {
-        result = await submitGreenhouse(page, job, resumeText, resumePdfUrl, focus);
-      } else if (job.ats_type === 'lever') {
-        result = await submitLever(page, job, resumeText, resumePdfUrl, focus);
-      } else if (job.ats_type === 'ashby') {
-        result = await submitAshby(page, job, resumeText, resumePdfUrl, focus);
-      }
-
-      if (result.duplicate) {
-        await supabase.from('applications').update({ status: 'duplicate', notes: result.message }).eq('id', job.id);
-        log(`  ♻ ${result.message}`);
-        duplicate++;
-        runLog.results.push({ job_id: job.id, company: job.company, status: 'duplicate' });
-      } else if (result.manual) {
-        await supabase.from('applications').update({ status: 'manual', notes: result.message }).eq('id', job.id);
-        log(`  📋 Manual: ${result.message}`);
-        manual++;
-        runLog.results.push({ job_id: job.id, company: job.company, status: 'manual' });
-      } else if (result.success) {
-        await supabase.from('applications').update({
-          status: 'submitted',
-          submission_time: Math.floor(Date.now() / 1000),
-          notes: result.message,
-        }).eq('id', job.id);
-        log(`  ✅ ${result.message}`);
-        submitted++;
-        runLog.results.push({ job_id: job.id, company: job.company, status: 'submitted' });
-      } else {
-        await supabase.from('applications').update({ status: 'failed', notes: result.message }).eq('id', job.id);
-        log(`  ❌ ${result.message}`);
-        failed++;
-        runLog.results.push({ job_id: job.id, company: job.company, status: 'failed', message: result.message });
-      }
-
-    } catch (err) {
-      log(`  💥 Exception: ${err.message}`);
-      await page.screenshot({ path: `/tmp/error-${job.id}.png`, fullPage: true }).catch(() => {});
-      const html = await page.content().catch(() => '');
-      if (html) fs.writeFileSync(`/tmp/error-${job.id}.html`, html.slice(0, 50000));
-      await supabase.from('applications').update({ status: 'failed', notes: `Exception: ${err.message}` }).eq('id', job.id);
-      failed++;
-    } finally {
-      await context.close();
-    }
-
-    if (i < jobs.length - 1) {
-      const delay = Math.floor(DELAY_BETWEEN_MS());
-      log(`  ⏳ Waiting ${Math.round(delay / 1000)}s...`);
-      await sleep(delay);
-    }
-  }
-
-  await browser.close();
-  log(`\n────────────────────────────────`);
-  log(`✅ Submitted:  ${submitted}`);
-  log(`♻ Duplicate:  ${duplicate}`);
-  log(`❌ Failed:     ${failed}`);
-  log(`📋 Manual:     ${manual}`);
-  log(`⏭ Skipped:    ${skipped}`);
-
-  runLog.completed_at = new Date().toISOString();
-  runLog.summary = { submitted, duplicate, failed, manual, skipped };
-  saveLog();
-}
-
-// ── Greenhouse ────────────────────────────────────────────────────────────────
-
-// Strict priority-ordered answer mapping for Greenhouse dropdowns
-function getDropdownAnswer(labelText) {
-  const c = labelText.toLowerCase();
-
-  // Priority 1: Sponsorship/visa — must come first before any other matching
-  if (c.includes('sponsor') || c.includes('visa') || c.includes('immigration') ||
-      c.includes('work authorization') || c.includes('future re')) return 'No';
-
-  // Priority 2: Work authorization — authorized/eligible to work
-  if (c.includes('authorized') || c.includes('eligible to work') ||
-      c.includes('legally') || c.includes('right to work')) return 'Yes';
-
-  // Priority 3: Non-compete / prior employer agreements
-  if (c.includes('non-compete') || c.includes('non compete') ||
-      c.includes('non-solicit') || c.includes('agreement with') ||
-      c.includes('former employer')) return 'No';
-
-  // Priority 4: Hybrid/in-office/relocate
-  if (c.includes('hybrid') || c.includes('in-office') || c.includes('in office') ||
-      c.includes('in-person') || c.includes('relocat') || c.includes('willing to work') ||
-      c.includes('commit to being')) return 'Yes';
-
-  // Priority 5: Previously worked at company
-  if (c.includes('previously worked') || c.includes('worked for') ||
-      c.includes('formerly') || c.includes('ever worked')) return 'No';
-
-  // Priority 6: State/province/metro
-  if (c.includes('state of residence') || c.includes('current state') ||
-      c.includes('province')) return 'California';
-  if (c.includes('metro') || c.includes('san francisco bay') ||
-      c.includes('based in sf') || c.includes('based in san francisco')) return 'San Francisco Bay';
-
-  // Priority 7: EEOC/diversity
-  if (c.includes('veteran')) return 'I am not a protected veteran';
-  if (c.includes('disability')) return 'No, I do not have a disability';
-  if (c.includes('gender') || c.includes('race') || c.includes('ethnicity') ||
-      c.includes('ethnic') || c.includes('sexual orientation') || c.includes('lgbtq') ||
-      c.includes('transgender') || c.includes('identify as') || c.includes('identify my') ||
-      c.includes('lgbtqia') || c.includes('pronoun')) {
-    return 'Decline';
-  }
-
-  // Priority 8: Referral source
-  if (c.includes('hear about') || c.includes('how did you') ||
-      c.includes('source') || c.includes('referred')) return 'LinkedIn';
-
-  // Priority 9: SQL/technical skills
-  if (c.includes('sql') || c.includes('advanced knowledge')) return 'Yes';
-
-  // Priority 10: AI tools
-  if (c.includes('ai tool') || c.includes('artificial intelligence')) return 'Yes';
-
-  // Priority 11: Yes/No catch-all for binary questions
-  if (c.includes('do you') || c.includes('are you') || c.includes('can you') ||
-      c.includes('will you') || c.includes('have you')) return 'Yes';
-
-  return null;
-}
-
-async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
-  try {
-    const jobId = job.external_id;
-    const slug = job.ats_slug;
-    const applyUrl = `https://boards.greenhouse.io/${slug}/jobs/${jobId}?gh_jid=${jobId}#app`;
-
-    log(`  🌐 ${applyUrl}`);
-    await page.goto(applyUrl, { waitUntil: 'load', timeout: 30000 });
-    
-    // Wait for form to fully render
-    try {
-      await page.waitForSelector(
-        '#application_form, #app, #first_name, input[id="first_name"]',
-        { state: 'visible', timeout: 12000 }
-      );
-      await page.waitForTimeout(1500);
-    } catch (e) {
-      log('  ⚠ Form not found after 12s — checking page state');
-    }
-
-    const finalUrl = page.url();
-    const finalDomain = new URL(finalUrl).hostname;
-    if (!finalDomain.includes('greenhouse.io')) {
-      // Mark known custom-site companies as manual permanently
-      const knownCustomSites = ['fivetran.com', 'airbnb.com', 'okta.com', 'lyft.com',
-        'pinterestcareers.com', 'careerpuck.com', 'samsara.com', 'databricks.com'];
-      if (knownCustomSites.some(s => finalDomain.includes(s))) {
-        try {
-          await supabase.from('companies')
-            .update({ active: false, notes: 'custom career site — cannot automate' })
-            .eq('ats_slug', job.ats_slug);
-        } catch(e) {}
-        log(`  📋 Deactivated custom-site company: ${job.company}`);
-      }
-      return { success: false, manual: true, message: `Custom site: ${finalDomain}` };
-    }
-
-    // Save debug HTML to understand form structure
-    const debugHtml = await page.content();
-    fs.writeFileSync('/tmp/greenhouse-debug.html', debugHtml.slice(0, 100000));
-    log(`  📄 Debug HTML saved (${debugHtml.length} chars)`);
-
-    // Check what form fields actually exist
-    const fieldIds = await page.evaluate(() => {
-      const inputs = document.querySelectorAll('input, textarea, select');
-      return [...inputs].map(el => ({ id: el.id, name: el.name, type: el.type, placeholder: el.placeholder })).filter(el => el.id || el.name);
-    });
-    log(`  📋 Form fields found: ${JSON.stringify(fieldIds.slice(0, 15))}`);
-
-    // Check form exists
-    const formExists = await page.$('form, #application-form, .application-form, #main_fields');
-    if (!formExists) {
-      return { success: false, message: `No form found at ${finalUrl}` };
-    }
-
-    // Standard fields — new Greenhouse form uses different IDs
-    await humanType(page, '#first_name', PROFILE.first_name);
-    await humanType(page, '#last_name', PROFILE.last_name);
-    await humanType(page, '#preferred_name', PROFILE.first_name); // some boards require this
-    await humanType(page, '#email', PROFILE.email);
-    await humanType(page, '#phone', PROFILE.phone_formatted);
-
-    // Location — new form uses #candidate-location with autocomplete
-    try {
-      const locField = await page.$('#candidate-location, #job_application_location');
-      if (locField) {
-        await locField.click();
-        await locField.fill('');
-        await page.waitForTimeout(300);
-        await locField.type(PROFILE.city, { delay: 50 });
-        await page.waitForTimeout(800);
-        await page.keyboard.press('ArrowDown');
-        await page.waitForTimeout(300);
-        await page.keyboard.press('Enter');
-        await page.waitForTimeout(300);
-        log(`  ✓ Location: ${PROFILE.city}`);
-      }
-    } catch (e) {
-      log(`  ⚠ Location field: ${e.message}`);
-    }
-
-    // Country — Greenhouse uses reactive autocomplete, must type + ArrowDown + Enter
-    try {
-      const countryField = await page.$('#country, input[id*="country" i]');
-      if (countryField) {
-        await countryField.click();
-        await countryField.fill('');
-        await page.waitForTimeout(300);
-        await countryField.type('United States', { delay: 50 });
-        await page.waitForTimeout(1000); // Wait for dropdown to populate
-        await page.keyboard.press('ArrowDown');
-        await page.waitForTimeout(300);
-        await page.keyboard.press('Enter');
-        await page.waitForTimeout(500);
-        log('  ✓ Country: United States');
-      } else {
-        // Try select dropdown
-        const countrySelect = await page.$('select[id*="country" i]');
-        if (countrySelect) {
-          await countrySelect.selectOption({ label: 'United States' }).catch(() =>
-            countrySelect.selectOption({ value: 'US' }).catch(() => {}));
-          log('  ✓ Country select: United States');
-        }
-      }
-    } catch (e) {
-      log(`  ⚠ Country field: ${e.message}`);
-    }
-
-    // LinkedIn — try multiple patterns
-    for (const sel of [
-      'input[name*="linkedin" i]', 
-      'input[id*="linkedin" i]', 
-      'input[placeholder*="linkedin" i]',
-      'input[id*="LinkedIn"]',
-      '[id="question_linkedin"]',
-    ]) {
-      if (await humanType(page, sel, PROFILE.linkedin)) { log('  ✓ LinkedIn filled'); break; }
-    }
-
-    // Website
-    for (const sel of ['input[name*="website" i]', 'input[id*="website" i]']) {
-      if (await humanType(page, sel, PROFILE.website)) break;
-    }
-
-    // Upload cover letter if field exists (required or not)
-    try {
-      const coverLetterInput = await page.$('input[type="file"][id="cover_letter"]');
-      if (coverLetterInput) {
-        const clPath = '/tmp/aaron_cover_letter.txt';
-        const clText = `Dear Hiring Manager,
-
-I am excited to apply for this role. With 10+ years in strategy and operations — including leading a $200M portfolio consolidation at Enova International and scaling Product School from $2M to $6M in revenue — I bring a proven track record of driving operational excellence and business growth.
-
-My experience spans cross-functional leadership, GTM strategy, revenue operations, and building scalable systems that deliver measurable impact. I am confident my background aligns strongly with the needs of this role and I look forward to contributing to your team.
-
-Please find additional details in my attached resume.
-
-Best regards,
-Aaron Filous
-filousaaron@gmail.com | (650) 291-3142
-linkedin.com/in/aaron-filous`;
-        fs.writeFileSync(clPath, clText);
-        await coverLetterInput.setInputFiles(clPath);
-        log('  📎 Cover letter uploaded');
-      }
-    } catch(e) { log('  ⚠ Cover letter: ' + e.message); }
-
-    // Upload resume PDF
-    let resumeUploaded = false;
-    if (resumePdfUrl) {
-      resumeUploaded = await uploadResumePdf(page, resumePdfUrl, [
-        'input[type="file"][id="resume"]',
-        'input[type="file"][id="resume_file"]',
-        'input[type="file"][name="job_application[resume]"]',
-        'input[type="file"][accept*="pdf"]',
-        'input[type="file"]',
-      ]);
-      if (resumeUploaded) log(`  📎 Resume PDF uploaded`);
-      else log(`  ⚠ Resume PDF upload failed — falling back to text`);
-    } else {
-      log(`  ⚠ No resume PDF URL — using text fallback`);
-    }
-
-    // Resume text — always fill as fallback
-    const resumeTextFilled = await fillField(page, [
-      '#resume_text',
-      'textarea[name="job_application[resume_text]"]',
-      'textarea[id*="resume"]',
-    ], resumeText.slice(0, 5000));
-    if (resumeTextFilled) log(`  📝 Resume text filled`);
-    else if (!resumeUploaded) log(`  ❌ Neither PDF nor text resume could be filled — submission will likely fail`);
-
-    await page.waitForTimeout(Math.floor(Math.random() * 800 + 400));
-
-    // Work authorization radio buttons
-    await handleRadioByText(page, /authorized.*work|work.*authorized|eligible.*work/i, /^Yes$/i);
-    await handleRadioByText(page, /require.*sponsorship|visa sponsor|need.*sponsor/i, /^No$/i);
-
-    // Broader radio sweep for willing/authorized/in-person questions
-    try {
-      const allFields = await page.$$('div.field, div[class*="field"]');
-      for (const field of allFields) {
-        const fieldText = (await field.textContent() || '').toLowerCase();
-        if (/willing|authorized|legally|currently.*us|relocate|in.person|on.?site/i.test(fieldText)) {
-          const labels = await field.$$('label');
-          for (const label of labels) {
-            const lt = (await label.textContent() || '').toLowerCase().trim();
-            if (lt === 'yes' || lt === 'true' || lt === 'i am' || lt === 'willing') {
-              await label.click();
-              log('  ✓ Radio Yes: ' + fieldText.slice(0, 40));
-              break;
-            }
-          }
-        }
-        if (/sponsorship|visa|sponsor/i.test(fieldText)) {
-          const labels = await field.$$('label');
-          for (const label of labels) {
-            const lt = (await label.textContent() || '').toLowerCase().trim();
-            if (lt === 'no' || lt === 'false' || lt === 'i do not') {
-              await label.click();
-              log('  ✓ Radio No: ' + fieldText.slice(0, 40));
-              break;
-            }
-          }
-        }
-      }
-    } catch(e) {
-      log('  ⚠ Radio sweep: ' + e.message);
-    }
-
-    // Work authorization dropdowns
-    await handleDropdownByText(page, /authorized.*work|work.*authorized/i, 'Yes');
-    await handleDropdownByText(page, /require.*sponsorship|visa/i, 'No');
-
-    // How did you hear
-    try {
-      const heardSel = await page.$('select[name*="referral" i], select[id*="heard" i]');
-      if (heardSel) await heardSel.selectOption({ label: 'LinkedIn' }).catch(() => {});
-    } catch (e) {}
-
-    // Greenhouse Form Handler — Label-to-Component approach
-    // Uses getDropdownAnswer() for strict priority mapping
-    // Targets VISIBLE dropdown trigger divs, not hidden backing inputs
-    try {
-      const allLabels = await page.$$('label');
-      for (const label of allLabels) {
-        const rawLabel = (await label.textContent() || '');
-        const labelText = rawLabel.toLowerCase();
-        const forAttr = await label.getAttribute('for');
-        if (!forAttr) continue;
-
-        // --- Text / textarea fields ---
-        if (forAttr.startsWith('question_') || /^\d/.test(forAttr)) {
-          const el = await page.$(`[id="${forAttr}"]`);
-          if (!el) continue;
-
-          const tag = await el.evaluate(e => e.tagName.toLowerCase());
-          const inputType = await el.evaluate(e => e.type || '');
-
-          if (tag === 'select') {
-            // Native select — use strict mapping
-            const answer = getDropdownAnswer(rawLabel) || null;
-            if (answer) {
-              await el.selectOption({ label: answer }).catch(() =>
-                el.selectOption({ label: answer + ' to self-identify' }).catch(() =>
-                  el.selectOption({ value: answer.toLowerCase() }).catch(() =>
-                    el.selectOption({ index: 1 }).catch(() => {}))));
-            } else {
-              await el.selectOption({ index: 1 }).catch(() => {});
-            }
-            log('  ✓ Native select: ' + rawLabel.slice(0, 40));
-
-          } else if (tag === 'textarea' || (tag === 'input' && !['file','hidden','radio','checkbox'].includes(inputType))) {
-            // Text input — check if it's actually a React dropdown backing field
-            const isHiddenBacking = await page.evaluate((id) => {
-              const el = document.getElementById(id);
-              if (!el) return false;
-              const style = window.getComputedStyle(el);
-              // Hidden backing fields are typically invisible
-              if (style.opacity === '0' || parseFloat(style.opacity) < 0.1) return true;
-              if (style.position === 'absolute' && (style.zIndex === '-1' || parseInt(style.zIndex) < 0)) return true;
-              if (style.visibility === 'hidden') return true;
-              // Check siblings for React dropdown indicators
-              const siblings = el.parentElement ? [...el.parentElement.children] : [];
-              return siblings.some(s => 
-                s !== el && (
-                  s.getAttribute('role') === 'combobox' ||
-                  (s.className && typeof s.className === 'string' && 
-                   (s.className.includes('css-') || s.className.includes('select') || s.className.includes('Select')))
-                )
-              );
-            }, forAttr).catch(() => false);
-
-            // For question_ fields with type=text: check if getDropdownAnswer returns an answer
-          // If yes, it's likely a React dropdown — try dropdown approach first, fall back to text
-          const dropdownAnswer = getDropdownAnswer(rawLabel);
-          
-          if (isHiddenBacking || (dropdownAnswer !== null && inputType === 'text')) {
-              // This is a React dropdown — find and click the visible trigger
-              const answer = dropdownAnswer;
-              if (answer !== null) {
-                try {
-                  // Walk up from label to find the field container
-                  const fieldContainer = await label.evaluateHandle(el => {
-                    let p = el.parentElement;
-                    for (let i = 0; i < 6; i++) {
-                      if (!p) break;
-                      const cls = (p.className || '').toString();
-                      // Look for field wrapper — Greenhouse uses various class patterns
-                      if (cls.includes('field') || cls.includes('Field') || 
-                          p.tagName === 'LI' || p.tagName === 'SECTION' ||
-                          (p.children.length > 1 && p.querySelector('label'))) return p;
-                      p = p.parentElement;
-                    }
-                    return el.parentElement;
-                  });
-
-                  // Find the visible dropdown trigger — Greenhouse uses css- prefixed classes
-                  const trigger = await fieldContainer.$(
-                    '[class*="css-"][class*="container"], [class*="css-"][class*="control"], ' +
-                    '[role="combobox"], div[class*="Select"], div[class*="select__control"]'
-                  ).catch(() => null);
-                  
-                  if (trigger) {
-                    const triggerVisible = await trigger.isVisible().catch(() => false);
-                    if (triggerVisible) {
-                      await trigger.scrollIntoViewIfNeeded();
-                      await trigger.click({ timeout: 3000 });
-                      await page.waitForTimeout(600);
-
-                      const answer_lower = answer.toLowerCase();
-                      const options = await page.$$('[role="option"], [class*="option"], ul[role="listbox"] li');
-                      let picked = false;
-
-                      for (const opt of options) {
-                        const optText = (await opt.innerText().catch(() => '')).toLowerCase().trim();
-                        if (optText.includes(answer_lower) || 
-                            answer_lower.includes(optText.slice(0, 20)) ||
-                            (answer === 'Decline' && (optText.includes('decline') || optText.includes('not wish') || optText.includes('prefer not') || optText.includes('choose not'))) ||
-                            (answer === 'No' && (optText === 'no' || optText.startsWith('no,') || optText.startsWith('no '))) ||
-                            (answer === 'Yes' && (optText === 'yes' || optText.startsWith('yes,') || optText.startsWith('yes '))) ||
-                            (answer === 'California' && optText.includes('california')) ||
-                            (answer === 'San Francisco Bay' && optText.includes('san francisco')) ||
-                            (answer === 'LinkedIn' && optText.includes('linkedin')) ||
-                            (answer === 'I am not a protected veteran' && (optText.includes('not a protected') || optText.includes('not a veteran') || optText.includes('i am not'))) ||
-                            (answer === 'No, I do not have a disability' && (optText.includes('do not have') || optText.includes('no disability') || optText.startsWith('no, i')))) {
-                          await opt.click({ timeout: 1500 });
-                          picked = true;
-                          log('  ✓ React dropdown [' + answer + ']: ' + rawLabel.slice(0, 40));
-                          break;
-                        }
-                      }
-
-                      if (!picked && options.length > 0) {
-                        for (const opt of options) {
-                          const optText = (await opt.innerText().catch(() => '')).trim();
-                          if (optText && !optText.toLowerCase().includes('select') && 
-                              !optText.toLowerCase().includes('not in the us') &&
-                              !optText.toLowerCase().includes('choose')) {
-                            await opt.click({ timeout: 1500 });
-                            log('  ✓ React dropdown (first): ' + optText.slice(0, 30));
-                            picked = true;
-                            break;
-                          }
-                        }
-                      }
-                      
-                      if (!picked) log('  ⚠ No options found for: ' + rawLabel.slice(0, 30));
-                      await page.waitForTimeout(200);
-                    } else {
-                      log('  ⚠ Trigger not visible: ' + rawLabel.slice(0, 30));
-                    }
-                  } else {
-                    // No trigger found — try clicking the element itself
-                    log('  ⚠ No css- trigger found, trying direct click: ' + rawLabel.slice(0, 30));
-                    try {
-                      await el.click({ timeout: 2000 });
-                      await page.waitForTimeout(400);
-                      const options = await page.$$('[role="option"]');
-                      for (const opt of options) {
-                        const optText = (await opt.innerText().catch(() => '')).toLowerCase().trim();
-                        if (optText.includes(answer.toLowerCase())) {
-                          await opt.click({ timeout: 1500 });
-                          log('  ✓ Direct click dropdown: ' + optText.slice(0, 30));
-                          break;
-                        }
-                      }
-                    } catch(ce) {}
-                  }
-                } catch(e) {
-                  log('  ⚠ React dropdown error (' + e.message.slice(0, 40) + '): ' + rawLabel.slice(0, 30));
-                }
-              }
-            } else {
-              // Regular visible text input
-              let answer = null;
-              if (/linkedin/i.test(labelText)) answer = PROFILE.linkedin;
-              else if (/salary|compensation|pay/i.test(labelText)) answer = '145000';
-              else if (/website|portfolio/i.test(labelText)) answer = PROFILE.linkedin;
-              else if (/zip|postal/i.test(labelText)) answer = '94401';
-              else if (/why.*work|why.*join|why.*interest|what makes you/i.test(labelText)) answer = 'I am excited to apply my 10+ years of strategy and operations experience. At Enova International I led a $200M portfolio consolidation and drove 200% increase in SDR call connection rates. I look forward to bringing this expertise to your team.';
-              else if (/experience|background|align|describe/i.test(labelText)) answer = 'My background spans strategy, operations, and cross-functional leadership at Enova International, Product School, and App Academy, plus founding Promotable to $40k/month. I consistently translate complex problems into scalable operational systems.';
-              else if (/company|employer|recent/i.test(labelText)) answer = 'Enova International';
-              else if (/pronouns/i.test(labelText)) answer = 'He/Him';
-              else if (/first.*gen|generation/i.test(labelText)) answer = 'Yes';
-              else {
-                const responses = job.generated_responses || {};
-                for (const [q, a] of Object.entries(responses)) {
-                  if (labelText.includes(q.toLowerCase().slice(0, 20))) { answer = String(a); break; }
-                }
-                if (!answer) answer = 'Please see my attached resume for details.';
-              }
-              await el.fill(answer.slice(0, 500));
-              log('  ✓ Text input: ' + rawLabel.slice(0, 50));
-            }
-          }
-        }
-      }
-    } catch (e) {
-      log('  ⚠ Form handler error: ' + e.message);
-    }
-
-    // EEOC fields by known IDs (Verkada pattern)
-    for (const eeocField of ['gender','hispanic_ethnicity','veteran_status','disability_status']) {
-      try {
-        const el = await page.$(`[id="${eeocField}"]`);
-        if (!el) continue;
-        const tag = await el.evaluate(e => e.tagName.toLowerCase());
-        if (tag === 'select') {
-          await el.selectOption({ index: 1 }).catch(() => {});
-          log('  ✓ EEOC select: ' + eeocField);
-        } else {
-          // React dropdown
-          await el.click().catch(() => {});
-          await page.waitForTimeout(400);
-          const options = await page.$$('[role="option"], ul li, [class*="option"]');
-          for (const opt of options) {
-            const t = (await opt.innerText().catch(() => '')).toLowerCase();
-            if (t.includes('decline') || t.includes('not wish') || t.includes('prefer not') ||
-                t.includes('choose not') || t.includes('not a protected') || 
-                t.includes('do not have a disability') || t.includes('i am not')) {
-              await opt.click();
-              log('  ✓ EEOC decline: ' + eeocField);
-              break;
-            }
-          }
-          // Fallback: pick first option
-          if (options.length > 0) {
-            await options[0].click().catch(() => {});
-          }
-          await page.waitForTimeout(300);
-        }
-      } catch(e) {}
-    }
-
-    // EEOC / Diversity self-identification — decline all to avoid missing field errors
-    try {
-      const allLabels = await page.$$('label');
-      for (const label of allLabels) {
-        const text = (await label.innerText() || '').toLowerCase();
-        if (text.includes('decline to self-identify') || 
-            text.includes('i do not wish to answer') ||
-            text.includes('prefer not to say') ||
-            text.includes('decline to identify') ||
-            text.includes('i do not wish to disclose')) {
-          await label.click();
-        }
-      }
-    } catch(e) {}
-
-    // Sweeper disabled — was causing 4+ minute hangs on invisible elements
-
-
-    // Submit button — scroll → hover → humanized click
-    const submitBtn = page.locator('#submit_app, input[type="submit"][value*="Submit" i], button[type="submit"]').first();
-    if (await submitBtn.count() === 0) {
-      const html = await page.content();
-      fs.writeFileSync('/tmp/greenhouse-debug.html', html.slice(0, 50000));
-      return { success: false, message: 'Submit button not found' };
-    }
-
-    // Set up success detection BEFORE clicking
-    // Greenhouse: native HTML form POST → navigates to /confirmation
-    const successPromise = Promise.any([
-      page.waitForRequest(
-        req => req.url().includes(`/v1/boards/${slug}/jobs/${jobId}/application`) && req.method() === 'POST',
-        { timeout: 15000 }
-      ),
-      page.waitForNavigation({
-        url: u => u.includes('confirmation'),
-        waitUntil: 'domcontentloaded',
-        timeout: 15000,
-      }),
-    ]).catch(() => null);
-
-    await submitBtn.scrollIntoViewIfNeeded();
-    await page.waitForTimeout(Math.floor(Math.random() * 1000 + 500));
-    await submitBtn.hover();
-    await page.waitForTimeout(Math.floor(Math.random() * 400 + 200));
-    log(`  🖱 Submitting...`);
-    await submitBtn.click({ delay: Math.floor(Math.random() * 150 + 50) });
-
-    const result = await successPromise;
-    const afterUrl = page.url();
-    const pageText = await page.textContent('body').catch(() => '');
-
-    // Check for duplicate application
-    if (pageText.match(/already applied|already submitted|previously applied/i)) {
-      return { duplicate: true, message: 'Already applied to this role' };
-    }
-
-    if (result) {
-      const resultUrl = typeof result.url === 'function' ? result.url() : afterUrl;
-      if (resultUrl.includes('confirmation')) {
-        return { success: true, message: `Submitted via Greenhouse ✓ (confirmed)` };
-      }
-      return { success: true, message: `Submitted via Greenhouse ✓ (POST intercepted)` };
-    }
-
-    // DOM fallbacks
-    if (pageText.match(/thank you|application received|submitted|we received/i)) {
-      return { success: true, message: 'Submitted via Greenhouse ✓ (DOM)' };
-    }
-    if (afterUrl.includes('confirmation')) {
-      return { success: true, message: `Submitted via Greenhouse ✓ (URL)` };
-    }
-    // Extract specific validation errors
-    const validationErrors = await page.evaluate(() => {
-      const errors = document.querySelectorAll('.error, .field-error, [class*="error"], [class*="invalid"]');
-      return [...errors].map(el => el.textContent?.trim()).filter(t => t && t.length > 0).slice(0, 10);
-    }).catch(() => []);
-    
-    if (validationErrors.length > 0) {
-      log(`  📋 Validation errors: ${validationErrors.join(' | ')}`);
-      
-      // Check if failures are due to custom questions we couldn't answer
-      const isCustomQuestionFailure = validationErrors.some(e => 
-        e.match(/why do you|tell us|describe|what is your|how did you hear|willing to|authorized|currently located/i)
-      );
-      
-      if (isCustomQuestionFailure) {
-        // Save missing questions to DB for later review
-        const missingQs = validationErrors.filter(e => 
-          e.match(/why do you|tell us|describe|what is your/i)
-        ).join(' | ');
-        return { 
-          success: false, 
-          needs_custom: true,
-          message: `Needs custom answers: ${missingQs.slice(0, 200)}` 
-        };
-      }
-      
-      return { success: false, message: `Validation: ${validationErrors.slice(0, 3).join(', ')}` };
-    }
-    
-    if (pageText.match(/error|required|invalid|can.t be blank/i)) {
-      return { success: false, message: `Validation error` };
-    }
-
-    // Save debug artifacts
-    await page.screenshot({ path: '/tmp/greenhouse-debug.png', fullPage: true }).catch(() => {});
-    const html = await page.content();
-    fs.writeFileSync('/tmp/greenhouse-debug.html', html.slice(0, 50000));
-    return { success: false, message: `No confirmation at ${afterUrl}` };
-
-  } catch (err) {
-    return { success: false, message: `Greenhouse error: ${err.message}` };
-  }
-}
-
-// ── Lever ─────────────────────────────────────────────────────────────────────
-async function submitLever(page, job, resumeText, resumePdfUrl, focus) {
-  try {
-    const applyUrl = job.url.includes('/apply') ? job.url : `${job.url}/apply`;
-    log(`  🌐 ${applyUrl}`);
-    await page.goto(applyUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(2000);
-
-    const finalDomain = new URL(page.url()).hostname;
-    if (!finalDomain.includes('lever.co')) {
-      return { success: false, manual: true, message: `Custom site: ${finalDomain}` };
-    }
-
-    // Upload resume FIRST — Lever auto-parses and fills fields
-    if (resumePdfUrl) {
-      await uploadResumePdf(page, resumePdfUrl, [
-        'input[type="file"][id="resume_file"]',
-        'input[type="file"]',
-      ]);
-      log(`  📎 Resume uploaded — waiting for parse...`);
-      await page.waitForTimeout(3500); // Wait for Lever's async parse
-    }
-
-    // Clear and fill after parse — guarantees our values win
-    // Target precise selectors to avoid triggering LinkedIn OAuth iframe
-    await clearAndType(page, 'input[name="name"]', PROFILE.full_name);
-    await clearAndType(page, 'input[name="email"]', PROFILE.email);
-    await clearAndType(page, 'input[name="phone"]', PROFILE.phone_formatted);
-
-    // Lever LinkedIn exact field name
-    await clearAndType(page, 'input[name="urls[LinkedIn]"]', PROFILE.linkedin);
-
-    // Custom questions
-    const answers = job.generated_responses || {};
-    for (const [question, answer] of Object.entries(answers)) {
-      await tryFillByLabel(page, question, String(answer));
-    }
-
-    await page.waitForTimeout(Math.floor(Math.random() * 800 + 400));
-
-    // Lever uses XHR — intercept API call OR /thanks redirect
-    const jobId = job.external_id;
-    const slug = job.ats_slug;
-    const leverPromise = Promise.any([
-      page.waitForResponse(
-        res => res.url().includes(`/v1/postings/${slug}/${jobId}/apply`) && res.status() === 200,
-        { timeout: 15000 }
-      ),
-      page.waitForNavigation({
-        url: u => u.includes('/thanks'),
-        waitUntil: 'domcontentloaded',
-        timeout: 15000,
-      }),
-    ]).catch(() => null);
-
-    // Submit with humanized click
-    for (const sel of ['button[data-qa="btn-submit"]', '.lever-button-black[type="submit"]', 'button[type="submit"]', 'input[type="submit"]']) {
-      const btn = await page.$(sel);
-      if (btn) {
-        await btn.scrollIntoViewIfNeeded();
-        await btn.hover();
-        await page.waitForTimeout(Math.floor(Math.random() * 300 + 100));
-        await btn.click({ delay: Math.floor(Math.random() * 100 + 50) });
-        break;
-      }
-    }
-
-    const leverResult = await leverPromise;
-    const leverUrl = page.url();
-    const leverText = await page.textContent('body').catch(() => '');
-    log(`  📍 ${leverUrl}`);
-
-    if (leverResult || leverUrl.includes('/thanks')) {
-      return { success: true, message: `Submitted via Lever ✓` };
-    }
-    if (leverText.match(/thank you|application received|submitted/i)) {
-      return { success: true, message: 'Submitted via Lever ✓ (DOM)' };
-    }
-
-    await page.screenshot({ path: '/tmp/lever-debug.png', fullPage: true }).catch(() => {});
-    return { success: false, message: `Lever: no confirmation at ${leverUrl}` };
-
-  } catch (err) {
-    return { success: false, message: `Lever error: ${err.message}` };
-  }
-}
-
-// ── Ashby ─────────────────────────────────────────────────────────────────────
-async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
-  try {
-    const applyUrl = job.url.includes('/application') ? job.url : `${job.url}/application`;
-    log(`  🌐 ${applyUrl}`);
-    await page.goto(applyUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(2000);
-
-    const finalDomain = new URL(page.url()).hostname;
-    if (!finalDomain.includes('ashbyhq.com')) {
-      return { success: false, manual: true, message: `Custom site: ${finalDomain}` };
-    }
-
-    // Standard fields
-    await humanType(page, 'input[name*="firstName" i]', PROFILE.first_name) ||
-    await humanType(page, 'input[placeholder*="First name" i]', PROFILE.first_name);
-
-    await humanType(page, 'input[name*="lastName" i]', PROFILE.last_name) ||
-    await humanType(page, 'input[placeholder*="Last name" i]', PROFILE.last_name);
-
-    await humanType(page, 'input[type="email"]', PROFILE.email);
-    await humanType(page, 'input[type="tel"]', PROFILE.phone_formatted);
-
-    for (const sel of ['input[name*="linkedin" i]', 'input[placeholder*="linkedin" i]']) {
-      if (await humanType(page, sel, PROFILE.linkedin)) break;
-    }
-
-    if (resumePdfUrl) {
-      await uploadResumePdf(page, resumePdfUrl, ['input[type="file"]']);
-    }
-
-    // Custom questions
-    const answers = job.generated_responses || {};
-    for (const [question, answer] of Object.entries(answers)) {
-      await tryFillByLabel(page, question, String(answer));
-    }
-
-    await page.waitForTimeout(Math.floor(Math.random() * 800 + 400));
-
-    // Ashby uses XHR — intercept API OR /application/success
-    // UUID for Ashby is job.external_id
-    const ashbyPromise = Promise.any([
-      page.waitForResponse(
-        res => res.url().includes('/api/non-auth/v1/postings/') &&
-               res.url().includes('/apply') &&
-               res.status() === 200,
-        { timeout: 15000 }
-      ),
-      page.waitForNavigation({
-        url: u => u.includes('/application/success'),
-        waitUntil: 'domcontentloaded',
-        timeout: 15000,
-      }),
-    ]).catch(() => null);
-
-    // Listen for network submission response BEFORE clicking
-    const networkPromise = page.waitForResponse(resp => {
-      const url = resp.url();
-      return url.includes('ashbyhq.com') && 
-             (url.includes('/application') || url.includes('/apply') || url.includes('/submit')) &&
-             resp.request().method() === 'POST';
-    }, { timeout: 15000 }).catch(() => null);
-
-    const ashbyBtn = page.locator('[type="submit"], button:has-text("Submit"), button:has-text("Apply")').first();
-    if (await ashbyBtn.count() > 0) {
-      await ashbyBtn.scrollIntoViewIfNeeded();
-      await ashbyBtn.hover();
-      await page.waitForTimeout(Math.floor(Math.random() * 300 + 100));
-      await ashbyBtn.click({ delay: Math.floor(Math.random() * 100 + 50) });
-    }
-
-    // Check network response
-    const networkResp = await networkPromise;
-    if (networkResp) {
-      const status = networkResp.status();
-      log(`  📡 Network response: ${status} from ${networkResp.url().slice(0, 60)}`);
-      if (status >= 400) {
-        return { success: false, message: `Ashby server rejected: ${status}` };
-      }
-    }
-
-    const ashbyResult = await ashbyPromise;
-    const ashbyUrl = page.url();
-    log(`  📍 ${ashbyUrl}`);
-
-    // STRICT confirmation — must navigate to /application/success or /thanks
-    if (ashbyResult || ashbyUrl.includes('/application/success') || ashbyUrl.includes('/thanks')) {
-      return { success: true, message: `Submitted via Ashby ✓` };
-    }
-
-    // Check body text ONLY for very specific confirmation phrases — not generic words like "submit" or "success"
-    const ashbyText = await page.textContent('body').catch(() => '');
-    if (ashbyText.match(/your application was successfully submitted|application received|thank you for applying/i)) {
-      return { success: true, message: 'Submitted via Ashby ✓ (DOM)' };
-    }
-
-    // Still on /application — submission did not complete
-    log(`  ⚠ Still on /application page — form may not have submitted`);
-    
-    // Check for validation errors
-    const ashbyErrors = await page.$$('[class*="error"], [class*="invalid"], [aria-invalid="true"]');
-    if (ashbyErrors.length > 0) {
-      const errTexts = await Promise.all(ashbyErrors.map(e => e.textContent().catch(() => '')));
-      log(`  📋 Ashby validation errors: ${errTexts.filter(Boolean).slice(0,3).join(' | ')}`);
-    }
-
-    await page.screenshot({ path: '/tmp/ashby-debug.png', fullPage: true }).catch(() => {});
-    return { success: false, message: `Ashby: no confirmation at ${ashbyUrl}` };
-
-  } catch (err) {
-    return { success: false, message: `Ashby error: ${err.message}` };
-  }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-// Human-like typing with random delays
-async function humanType(page, selector, value) {
-  if (!value) return false;
-  try {
-    const el = await page.$(selector);
-    if (!el) return false;
-    await el.click();
-    await el.fill('');
-    for (const char of value) {
-      await page.keyboard.type(char);
-      await page.waitForTimeout(Math.floor(Math.random() * 40 + 10));
-    }
-    await page.waitForTimeout(Math.floor(Math.random() * 200 + 100));
-    return true;
-  } catch (e) { return false; }
-}
-
-// Clear existing value then type — used after Lever auto-parse
-async function clearAndType(page, selector, value) {
-  if (!value) return false;
-  try {
-    const el = await page.$(selector);
-    if (!el) return false;
-    await el.fill('');
-    await el.fill(value);
-    return true;
-  } catch (e) { return false; }
-}
-
-// Fill field from list of selectors
-async function fillField(page, selectors, value) {
-  if (!value) return false;
-  for (const sel of selectors) {
-    try {
-      const el = await page.$(sel);
-      if (el) { await el.fill(value); return true; }
-    } catch (e) {}
-  }
-  return false;
-}
-
-// Handle radio buttons by matching label text
-async function handleRadioByText(page, questionRegex, answerRegex) {
-  try {
-    const fieldBlock = page.locator('div.field', { hasText: questionRegex });
-    if (await fieldBlock.count() === 0) return false;
-    const label = fieldBlock.locator('label', { hasText: answerRegex });
-    if (await label.count() > 0) {
-      await label.first().click();
-      return true;
-    }
-  } catch (e) {}
-  return false;
-}
-
-// Handle select dropdowns by matching label text
-async function handleDropdownByText(page, questionRegex, value) {
-  try {
-    const fieldBlock = page.locator('div.field', { hasText: questionRegex });
-    if (await fieldBlock.count() === 0) return false;
-    const select = fieldBlock.locator('select');
-    if (await select.count() > 0) {
-      await select.first().selectOption({ label: value }).catch(() =>
-        select.first().selectOption({ value: value.toLowerCase() }).catch(() => {})
-      );
-      return true;
-    }
-  } catch (e) {}
-  return false;
-}
-
-// Fill field by matching label text (for custom questions)
-async function tryFillByLabel(page, labelText, value) {
-  if (!value || !labelText) return false;
-  try {
-    const labels = await page.$$('label');
-    for (const label of labels) {
-      const text = await label.textContent();
-      if (text && text.toLowerCase().includes(labelText.toLowerCase().slice(0, 25))) {
-        const forAttr = await label.getAttribute('for');
-        if (forAttr) {
-          const input = await page.$(`[id="${forAttr}"]`);
-          if (input) {
-            const tag = await input.evaluate(el => el.tagName.toLowerCase());
-            const type = await input.evaluate(el => el.type || '');
-            if (tag === 'textarea' || (tag === 'input' && !['radio', 'checkbox', 'file', 'hidden'].includes(type))) {
-              await input.fill(value);
-              return true;
-            }
-            if (tag === 'select') {
-              await input.selectOption({ label: value }).catch(() => {});
-              return true;
-            }
-          }
-        }
-      }
-    }
-  } catch (e) {}
-  return false;
-}
-
-// Upload resume PDF from URL
-async function uploadResumePdf(page, pdfUrl, selectors) {
-  try {
-    // Download PDF first
-    log(`  📥 Downloading resume...`);
-    const response = await fetch(pdfUrl);
-    if (!response.ok) { log(`  ⚠ Resume download failed: ${response.status}`); return false; }
-
-    const buffer = await response.arrayBuffer();
-    const tmpPath = require('path').resolve('/tmp', 'aaron_resume.pdf');
-    fs.writeFileSync(tmpPath, Buffer.from(buffer));
-
-    // Verify file exists and has content
-    if (!fs.existsSync(tmpPath) || fs.statSync(tmpPath).size === 0) {
-      log(`  ⚠ Resume file empty or missing at ${tmpPath}`);
-      return false;
-    }
-    log(`  💾 Resume ready: ${fs.statSync(tmpPath).size} bytes at ${tmpPath}`);
-
-    // Try file input directly first
-    for (const sel of selectors) {
-      const fileInput = await page.$(sel);
-      if (fileInput) {
-        log(`  📎 Setting file on input: ${sel}`);
-        await fileInput.setInputFiles(tmpPath);
-        await page.waitForTimeout(1500);
-        log(`  ✅ Resume uploaded via setInputFiles`);
-        return true;
-      }
-    }
-
-    // Fallback: use file chooser event
-    log(`  📎 Trying file chooser approach...`);
-    const fileChooserPromise = page.waitForEvent('filechooser', { timeout: 5000 });
-    await page.click('input[type="file"], [data-automation-id*="resume"], label[for*="resume"]').catch(() => {});
-    const fileChooser = await fileChooserPromise.catch(() => null);
-    if (fileChooser) {
-      await fileChooser.setFiles(tmpPath);
-      await page.waitForTimeout(1500);
-      log(`  ✅ Resume uploaded via file chooser`);
-      return true;
-    }
-
-    log(`  ⚠ No file input found`);
-    return false;
-  } catch (e) {
-    log(`  ⚠ Resume upload failed: ${e.message}`);
-    return false;
-  }
-}
-
-function saveLog() {
-  fs.writeFileSync('run-log.json', JSON.stringify(runLog, null, 2));
-  log(`\n📝 Run log saved`);
-}
-
-main().catch(err => {
-  log(`💥 Fatal: ${err.message}`);
-  runLog.error = err.message;
-  saveLog();
-  process.exit(1);
-});
+Skip to content
+afilous
+job-autopilot
+Repository navigation
+Code
+Issues
+Pull requests
+Actions
+Projects
+Wiki
+Security and quality
+Insights
+Settings
+Job Autopilot — Submit Applications
+Job Autopilot — Submit Applications #24
+All jobs
+Run details
+submit
+succeeded 1 minute ago in 7m 46s
+Search logs
+1s
+0s
+1s
+3s
+Run npm install
+npm warn deprecated node-domexception@1.0.0: Use your platform's native DOMException instead
+added 17 packages, and audited 18 packages in 3s
+3 packages are looking for funding
+  run `npm fund` for details
+found 0 vulnerabilities
+25s
+Installing dependencies...
+Switching to root user to install dependencies...
+Get:1 file:/etc/apt/apt-mirrors.txt Mirrorlist [144 B]
+Hit:2 http://azure.archive.ubuntu.com/ubuntu noble InRelease
+Get:3 http://azure.archive.ubuntu.com/ubuntu noble-updates InRelease [126 kB]
+Get:4 http://azure.archive.ubuntu.com/ubuntu noble-backports InRelease [126 kB]
+Get:5 http://azure.archive.ubuntu.com/ubuntu noble-security InRelease [126 kB]
+Get:6 https://packages.microsoft.com/repos/azure-cli noble InRelease [3564 B]
+Get:7 https://packages.microsoft.com/ubuntu/24.04/prod noble InRelease [3600 B]
+Get:8 https://dl.google.com/linux/chrome-stable/deb stable InRelease [1825 B]
+Get:9 http://azure.archive.ubuntu.com/ubuntu noble-updates/main amd64 Packages [2064 kB]
+Get:10 http://azure.archive.ubuntu.com/ubuntu noble-updates/main Translation-en [362 kB]
+Get:11 http://azure.archive.ubuntu.com/ubuntu noble-updates/main amd64 Components [177 kB]
+Get:12 http://azure.archive.ubuntu.com/ubuntu noble-updates/main amd64 c-n-f Metadata [17.4 kB]
+Get:13 http://azure.archive.ubuntu.com/ubuntu noble-updates/universe amd64 Packages [1696 kB]
+Get:14 http://azure.archive.ubuntu.com/ubuntu noble-updates/universe Translation-en [331 kB]
+Get:15 http://azure.archive.ubuntu.com/ubuntu noble-updates/universe amd64 Components [386 kB]
+Get:16 http://azure.archive.ubuntu.com/ubuntu noble-updates/universe amd64 c-n-f Metadata [34.6 kB]
+Get:17 http://azure.archive.ubuntu.com/ubuntu noble-updates/restricted amd64 Packages [3299 kB]
+Get:18 http://azure.archive.ubuntu.com/ubuntu noble-updates/restricted Translation-en [764 kB]
+Get:19 http://azure.archive.ubuntu.com/ubuntu noble-updates/restricted amd64 c-n-f Metadata [456 B]
+Get:20 http://azure.archive.ubuntu.com/ubuntu noble-updates/multiverse Translation-en [11.3 kB]
+Get:21 http://azure.archive.ubuntu.com/ubuntu noble-updates/multiverse amd64 Components [940 B]
+Get:22 http://azure.archive.ubuntu.com/ubuntu noble-updates/multiverse amd64 c-n-f Metadata [656 B]
+Get:23 http://azure.archive.ubuntu.com/ubuntu noble-backports/main amd64 Components [5764 B]
+Get:24 http://azure.archive.ubuntu.com/ubuntu noble-backports/universe amd64 Components [10.5 kB]
+Get:25 http://azure.archive.ubuntu.com/ubuntu noble-backports/universe amd64 c-n-f Metadata [1588 B]
+Get:26 http://azure.archive.ubuntu.com/ubuntu noble-security/main amd64 Packages [1761 kB]
+Get:27 http://azure.archive.ubuntu.com/ubuntu noble-security/main Translation-en [275 kB]
+Get:28 http://azure.archive.ubuntu.com/ubuntu noble-security/main amd64 Components [42.4 kB]
+Get:29 http://azure.archive.ubuntu.com/ubuntu noble-security/main amd64 c-n-f Metadata [11.4 kB]
+Get:30 http://azure.archive.ubuntu.com/ubuntu noble-security/universe amd64 Packages [1194 kB]
+Get:31 http://azure.archive.ubuntu.com/ubuntu noble-security/universe Translation-en [231 kB]
+Get:32 http://azure.archive.ubuntu.com/ubuntu noble-security/universe amd64 Components [74.2 kB]
+Get:33 http://azure.archive.ubuntu.com/ubuntu noble-security/universe amd64 c-n-f Metadata [23.2 kB]
+Get:39 https://packages.microsoft.com/repos/azure-cli noble/main amd64 Packages [2255 B]
+Get:34 http://azure.archive.ubuntu.com/ubuntu noble-security/restricted amd64 Packages [3106 kB]
+Get:40 https://packages.microsoft.com/ubuntu/24.04/prod noble/main amd64 Packages [168 kB]
+Get:41 https://packages.microsoft.com/ubuntu/24.04/prod noble/main arm64 Packages [138 kB]
+Get:35 http://azure.archive.ubuntu.com/ubuntu noble-security/restricted Translation-en [721 kB]
+Get:36 http://azure.archive.ubuntu.com/ubuntu noble-security/restricted amd64 c-n-f Metadata [444 B]
+Get:37 http://azure.archive.ubuntu.com/ubuntu noble-security/multiverse Translation-en [9248 B]
+Get:38 http://azure.archive.ubuntu.com/ubuntu noble-security/multiverse amd64 c-n-f Metadata [468 B]
+Get:42 https://dl.google.com/linux/chrome-stable/deb stable/main amd64 Packages [1207 B]
+Fetched 17.3 MB in 2s (9255 kB/s)
+Reading package lists...
+Reading package lists...
+Building dependency tree...
+Reading state information...
+libasound2t64 is already the newest version (1.2.11-1ubuntu0.2).
+libasound2t64 set to manually installed.
+libatk-bridge2.0-0t64 is already the newest version (2.52.0-1build1).
+libatk-bridge2.0-0t64 set to manually installed.
+libatk1.0-0t64 is already the newest version (2.52.0-1build1).
+libatk1.0-0t64 set to manually installed.
+libatspi2.0-0t64 is already the newest version (2.52.0-1build1).
+libatspi2.0-0t64 set to manually installed.
+libcairo2 is already the newest version (1.18.0-3build1).
+libcairo2 set to manually installed.
+libcups2t64 is already the newest version (2.4.7-1.2ubuntu7.9).
+libcups2t64 set to manually installed.
+libdbus-1-3 is already the newest version (1.14.10-4ubuntu4.1).
+libdbus-1-3 set to manually installed.
+libdrm2 is already the newest version (2.4.125-1ubuntu0.1~24.04.1).
+libdrm2 set to manually installed.
+libgbm1 is already the newest version (25.2.8-0ubuntu0.24.04.1).
+libgbm1 set to manually installed.
+libglib2.0-0t64 is already the newest version (2.80.0-6ubuntu3.8).
+libglib2.0-0t64 set to manually installed.
+libnspr4 is already the newest version (2:4.35-1.1build1).
+libnspr4 set to manually installed.
+libnss3 is already the newest version (2:3.98-1ubuntu0.1).
+libnss3 set to manually installed.
+libpango-1.0-0 is already the newest version (1.52.1+ds-1build1).
+libpango-1.0-0 set to manually installed.
+libx11-6 is already the newest version (2:1.8.7-1build1).
+libx11-6 set to manually installed.
+libxcb1 is already the newest version (1.15-1ubuntu2).
+libxcb1 set to manually installed.
+libxcomposite1 is already the newest version (1:0.4.5-1build3).
+libxcomposite1 set to manually installed.
+libxdamage1 is already the newest version (1:1.1.6-1build1).
+libxdamage1 set to manually installed.
+libxext6 is already the newest version (2:1.3.4-1build2).
+libxext6 set to manually installed.
+libxfixes3 is already the newest version (1:6.0.0-2build1).
+libxfixes3 set to manually installed.
+libxkbcommon0 is already the newest version (1.6.0-1build1).
+libxkbcommon0 set to manually installed.
+libxrandr2 is already the newest version (2:1.5.2-2build1).
+libxrandr2 set to manually installed.
+xvfb is already the newest version (2:21.1.12-1ubuntu1.5).
+fonts-noto-color-emoji is already the newest version (2.047-0ubuntu0.24.04.1).
+libfontconfig1 is already the newest version (2.15.0-1.1ubuntu2).
+libfontconfig1 set to manually installed.
+libfreetype6 is already the newest version (2.13.2+dfsg-1ubuntu0.1).
+libfreetype6 set to manually installed.
+fonts-liberation is already the newest version (1:2.1.5-3).
+fonts-liberation set to manually installed.
+The following additional packages will be installed:
+  xfonts-encodings xfonts-utils
+Recommended packages:
+  fonts-ipafont-mincho fonts-tlwg-loma
+The following NEW packages will be installed:
+  fonts-freefont-ttf fonts-ipafont-gothic fonts-tlwg-loma-otf fonts-unifont
+  fonts-wqy-zenhei xfonts-cyrillic xfonts-encodings xfonts-scalable
+  xfonts-utils
+0 upgraded, 9 newly installed, 0 to remove and 72 not upgraded.
+Need to get 21.1 MB of archives.
+After this operation, 79.5 MB of additional disk space will be used.
+Get:1 file:/etc/apt/apt-mirrors.txt Mirrorlist [144 B]
+Get:2 http://azure.archive.ubuntu.com/ubuntu noble/universe amd64 fonts-ipafont-gothic all 00303-21ubuntu1 [3513 kB]
+Get:3 http://azure.archive.ubuntu.com/ubuntu noble/main amd64 fonts-freefont-ttf all 20211204+svn4273-2 [5641 kB]
+Get:4 http://azure.archive.ubuntu.com/ubuntu noble/universe amd64 fonts-tlwg-loma-otf all 1:0.7.3-1 [107 kB]
+Get:5 http://azure.archive.ubuntu.com/ubuntu noble/universe amd64 fonts-unifont all 1:15.1.01-1build1 [2993 kB]
+Get:6 http://azure.archive.ubuntu.com/ubuntu noble/universe amd64 fonts-wqy-zenhei all 0.9.45-8 [7472 kB]
+Get:7 http://azure.archive.ubuntu.com/ubuntu noble/main amd64 xfonts-encodings all 1:1.0.5-0ubuntu2 [578 kB]
+Get:8 http://azure.archive.ubuntu.com/ubuntu noble/main amd64 xfonts-utils amd64 1:7.7+6build3 [94.4 kB]
+Get:9 http://azure.archive.ubuntu.com/ubuntu noble/universe amd64 xfonts-cyrillic all 1:1.0.5+nmu1 [384 kB]
+Get:10 http://azure.archive.ubuntu.com/ubuntu noble/main amd64 xfonts-scalable all 1:1.0.3-1.3 [304 kB]
+Fetched 21.1 MB in 2s (10.5 MB/s)
+Selecting previously unselected package fonts-ipafont-gothic.
+(Reading database ... 
+(Reading database ... 5%
+(Reading database ... 10%
+(Reading database ... 15%
+(Reading database ... 20%
+(Reading database ... 25%
+(Reading database ... 30%
+(Reading database ... 35%
+(Reading database ... 40%
+(Reading database ... 45%
+(Reading database ... 50%
+(Reading database ... 55%
+(Reading database ... 60%
+(Reading database ... 65%
+(Reading database ... 70%
+(Reading database ... 75%
+(Reading database ... 80%
+(Reading database ... 85%
+(Reading database ... 90%
+(Reading database ... 95%
+(Reading database ... 100%
+(Reading database ... 202271 files and directories currently installed.)
+Preparing to unpack .../0-fonts-ipafont-gothic_00303-21ubuntu1_all.deb ...
+Unpacking fonts-ipafont-gothic (00303-21ubuntu1) ...
+Selecting previously unselected package fonts-freefont-ttf.
+Preparing to unpack .../1-fonts-freefont-ttf_20211204+svn4273-2_all.deb ...
+Unpacking fonts-freefont-ttf (20211204+svn4273-2) ...
+Selecting previously unselected package fonts-tlwg-loma-otf.
+Preparing to unpack .../2-fonts-tlwg-loma-otf_1%3a0.7.3-1_all.deb ...
+Unpacking fonts-tlwg-loma-otf (1:0.7.3-1) ...
+Selecting previously unselected package fonts-unifont.
+Preparing to unpack .../3-fonts-unifont_1%3a15.1.01-1build1_all.deb ...
+Unpacking fonts-unifont (1:15.1.01-1build1) ...
+Selecting previously unselected package fonts-wqy-zenhei.
+Preparing to unpack .../4-fonts-wqy-zenhei_0.9.45-8_all.deb ...
+Unpacking fonts-wqy-zenhei (0.9.45-8) ...
+Selecting previously unselected package xfonts-encodings.
+Preparing to unpack .../5-xfonts-encodings_1%3a1.0.5-0ubuntu2_all.deb ...
+Unpacking xfonts-encodings (1:1.0.5-0ubuntu2) ...
+Selecting previously unselected package xfonts-utils.
+Preparing to unpack .../6-xfonts-utils_1%3a7.7+6build3_amd64.deb ...
+Unpacking xfonts-utils (1:7.7+6build3) ...
+Selecting previously unselected package xfonts-cyrillic.
+Preparing to unpack .../7-xfonts-cyrillic_1%3a1.0.5+nmu1_all.deb ...
+Unpacking xfonts-cyrillic (1:1.0.5+nmu1) ...
+Selecting previously unselected package xfonts-scalable.
+Preparing to unpack .../8-xfonts-scalable_1%3a1.0.3-1.3_all.deb ...
+Unpacking xfonts-scalable (1:1.0.3-1.3) ...
+Setting up fonts-wqy-zenhei (0.9.45-8) ...
+Setting up fonts-freefont-ttf (20211204+svn4273-2) ...
+Setting up fonts-tlwg-loma-otf (1:0.7.3-1) ...
+Setting up xfonts-encodings (1:1.0.5-0ubuntu2) ...
+Setting up fonts-ipafont-gothic (00303-21ubuntu1) ...
+update-alternatives: using /usr/share/fonts/opentype/ipafont-gothic/ipag.ttf to provide /usr/share/fonts/truetype/fonts-japanese-gothic.ttf (fonts-japanese-gothic.ttf) in auto mode
+Setting up fonts-unifont (1:15.1.01-1build1) ...
+Setting up xfonts-utils (1:7.7+6build3) ...
+Setting up xfonts-cyrillic (1:1.0.5+nmu1) ...
+Setting up xfonts-scalable (1:1.0.3-1.3) ...
+Processing triggers for man-db (2.12.0-4build2) ...
+Not building database; man-db/auto-update is not 'true'.
+Processing triggers for fontconfig (2.15.0-1.1ubuntu2) ...
+Running kernel seems to be up-to-date.
+No services need to be restarted.
+No containers need to be restarted.
+No user sessions are running outdated binaries.
+No VM guests are running outdated hypervisor (qemu) binaries on this host.
+Downloading Chrome for Testing 148.0.7778.96 (playwright chromium v1223) from https://cdn.playwright.dev/builds/cft/148.0.7778.96/linux64/chrome-linux64.zip
+|                                                                                |   0% of 175.4 MiB
+|■■■■■■■■                                                                        |  10% of 175.4 MiB
+|■■■■■■■■■■■■■■■■                                                                |  20% of 175.4 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■                                                        |  30% of 175.4 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                                                |  40% of 175.4 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                                        |  50% of 175.4 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                                |  60% of 175.4 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                        |  70% of 175.4 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                |  80% of 175.4 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■        |  90% of 175.4 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■| 100% of 175.4 MiB
+Chrome for Testing 148.0.7778.96 (playwright chromium v1223) downloaded to /home/runner/.cache/ms-playwright/chromium-1223
+Downloading FFmpeg (playwright ffmpeg v1011) from https://cdn.playwright.dev/dbazure/download/playwright/builds/ffmpeg/1011/ffmpeg-linux.zip
+|                                                                                |   0% of 2.3 MiB
+|■■■■■■■■                                                                        |  10% of 2.3 MiB
+|■■■■■■■■■■■■■■■■                                                                |  20% of 2.3 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■                                                        |  30% of 2.3 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                                                |  40% of 2.3 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                                        |  50% of 2.3 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                                |  60% of 2.3 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                        |  70% of 2.3 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                |  80% of 2.3 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■        |  90% of 2.3 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■| 100% of 2.3 MiB
+FFmpeg (playwright ffmpeg v1011) downloaded to /home/runner/.cache/ms-playwright/ffmpeg-1011
+Downloading Chrome Headless Shell 148.0.7778.96 (playwright chromium-headless-shell v1223) from https://cdn.playwright.dev/builds/cft/148.0.7778.96/linux64/chrome-headless-shell-linux64.zip
+|                                                                                |   0% of 113.2 MiB
+|■■■■■■■■                                                                        |  10% of 113.2 MiB
+|■■■■■■■■■■■■■■■■                                                                |  20% of 113.2 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■                                                        |  30% of 113.2 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                                                |  40% of 113.2 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                                        |  50% of 113.2 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                                |  60% of 113.2 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                        |  70% of 113.2 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■                |  80% of 113.2 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■        |  90% of 113.2 MiB
+|■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■■| 100% of 113.2 MiB
+Chrome Headless Shell 148.0.7778.96 (playwright chromium-headless-shell v1223) downloaded to /home/runner/.cache/ms-playwright/chromium_headless_shell-1223
+7m 12s
+Run node submit.js
+  
+[2026-06-06T06:35:52.185Z] 🚀 Starting job submission run
+[2026-06-06T06:35:53.074Z] 📋 Found 10 jobs to submit (min score: 75%)
+[2026-06-06T06:35:53.139Z] 📄 Resume: Aaron Filous Resume 2025.pdf
+[2026-06-06T06:35:53.305Z] 
+[1/10] Sales Strategy and Operations Manager (Sr) - Strategic Planning at Verkada (greenhouse)
+[2026-06-06T06:35:53.305Z]   Score: 90% | Variant: default
+[2026-06-06T06:35:53.594Z]   🎯 Answer focus: Operational framework construction
+[2026-06-06T06:35:53.595Z]   🌐 https://boards.greenhouse.io/verkada/jobs/4946020007?gh_jid=4946020007#app
+[2026-06-06T06:35:54.556Z]   🖥 Failed to load resource: the server responded with a status of 401 ()
+[2026-06-06T06:35:54.560Z]   🖥 JS error: Unauthorized: User is not logged in.
+[2026-06-06T06:35:55.766Z]   📄 Debug HTML saved (136268 chars)
+[2026-06-06T06:35:55.770Z]   📋 Form fields found: [{"id":"first_name","name":"","type":"text","placeholder":""},{"id":"last_name","name":"","type":"text","placeholder":""},{"id":"preferred_name","name":"","type":"text","placeholder":""},{"id":"email","name":"","type":"text","placeholder":""},{"id":"country","name":"","type":"text","placeholder":""},{"id":"iti-0__search-input","name":"","type":"search","placeholder":"Search"},{"id":"phone","name":"","type":"tel","placeholder":""},{"id":"candidate-location","name":"","type":"text","placeholder":""},{"id":"resume","name":"","type":"file","placeholder":""},{"id":"question_10537108007","name":"","type":"text","placeholder":""},{"id":"question_10537109007","name":"","type":"text","placeholder":""},{"id":"gender","name":"","type":"text","placeholder":""},{"id":"hispanic_ethnicity","name":"","type":"text","placeholder":""},{"id":"veteran_status","name":"","type":"text","placeholder":""},{"id":"disability_status","name":"","type":"text","placeholder":""}]
+[2026-06-06T06:35:55.854Z]   🖥 Failed to load resource: the server responded with a status of 401 ()
+[2026-06-06T06:35:55.859Z]   🖥 JS error: Unauthorized: User is not logged in.
+[2026-06-06T06:36:00.808Z]   ✓ Location: San Mateo
+[2026-06-06T06:36:03.703Z]   ✓ Country: United States
+[2026-06-06T06:36:03.717Z]   📥 Downloading resume...
+[2026-06-06T06:36:04.062Z]   💾 Resume ready: 143071 bytes at /tmp/aaron_resume.pdf
+[2026-06-06T06:36:04.066Z]   📎 Setting file on input: input[type="file"][id="resume"]
+[2026-06-06T06:36:05.580Z]   ✅ Resume uploaded via setInputFiles
+[2026-06-06T06:36:05.580Z]   📎 Resume PDF uploaded
+[2026-06-06T06:36:06.306Z]   ✓ Text input: LinkedIn Profile
+[2026-06-06T06:36:06.326Z]   ✓ Text input: Website
+[2026-06-06T06:36:08.328Z]   ✓ EEOC decline: gender
+[2026-06-06T06:36:09.695Z]   ✓ EEOC decline: hispanic_ethnicity
+[2026-06-06T06:36:11.060Z]   ✓ EEOC decline: veteran_status
+[2026-06-06T06:36:12.428Z]   ✓ EEOC decline: disability_status
+[2026-06-06T06:36:14.738Z]   🖱 Submitting...
+[2026-06-06T06:36:15.096Z]   🖥 Connecting to 'https://www.recaptcha.net/recaptcha/enterprise/clr?k=6LfmcbcpAAAAAChNTbhUShzUOAMj_wY9LQIvLFX0' violates the following Content Security Policy directive: "connect-src 'self' api.mapbox.com docs.google.com/feeds/download/documents/export/Export *.amazonaws.com *.googleapis.com *.googleusercontent.com api.rollbar.com api.geocode.earth https://api-geocode-earth-proxy.greenhouse.io/ *.dropboxusercontent.com *.dropbox.com *.dropboxapi.com www.google.com auth.seek.com apply-api.gograyscale.com wss://apply-api-realtime.gograyscale.com apply.grsc.io https://prod-jben.prod-use1-0.gh.internal boards.greenhouse.io job-boards.cdn.greenhouse.io email-address-validator.us.greenhouse.io https://my.greenhouse.io c.spl.greenhouse.io". The action has been blocked.
+[2026-06-06T06:36:15.096Z]   🖥 Fetch API cannot load https://www.recaptcha.net/recaptcha/enterprise/clr?k=6LfmcbcpAAAAAChNTbhUShzUOAMj_wY9LQIvLFX0. Refused to connect because it violates the document's Content Security Policy.
+[2026-06-06T06:36:15.097Z]   🖥 Connecting to 'https://www.recaptcha.net/recaptcha/enterprise/clr?k=6LfmcbcpAAAAAChNTbhUShzUOAMj_wY9LQIvLFX0' violates the following Content Security Policy directive: "connect-src 'self' api.mapbox.com docs.google.com/feeds/download/documents/export/Export *.amazonaws.com *.googleapis.com *.googleusercontent.com api.rollbar.com api.geocode.earth https://api-geocode-earth-proxy.greenhouse.io/ *.dropboxusercontent.com *.dropbox.com *.dropboxapi.com www.google.com auth.seek.com apply-api.gograyscale.com wss://apply-api-realtime.gograyscale.com apply.grsc.io https://prod-jben.prod-use1-0.gh.internal boards.greenhouse.io job-boards.cdn.greenhouse.io email-address-validator.us.greenhouse.io https://my.greenhouse.io c.spl.greenhouse.io". The action has been blocked.
+[2026-06-06T06:36:15.097Z]   🖥 Fetch API cannot load https://www.recaptcha.net/recaptcha/enterprise/clr?k=6LfmcbcpAAAAAChNTbhUShzUOAMj_wY9LQIvLFX0. Refused to connect because it violates the document's Content Security Policy.
+[2026-06-06T06:36:15.097Z]   🖥 Connecting to 'https://www.recaptcha.net/recaptcha/enterprise/clr?k=6LfmcbcpAAAAAChNTbhUShzUOAMj_wY9LQIvLFX0' violates the following Content Security Policy directive: "connect-src 'self' api.mapbox.com docs.google.com/feeds/download/documents/export/Export *.amazonaws.com *.googleapis.com *.googleusercontent.com api.rollbar.com api.geocode.earth https://api-geocode-earth-proxy.greenhouse.io/ *.dropboxusercontent.com *.dropbox.com *.dropboxapi.com www.google.com auth.seek.com apply-api.gograyscale.com wss://apply-api-realtime.gograyscale.com apply.grsc.io https://prod-jben.prod-use1-0.gh.internal boards.greenhouse.io job-boards.cdn.greenhouse.io email-address-validator.us.greenhouse.io https://my.greenhouse.io c.spl.greenhouse.io". The action has been blocked.
+[2026-06-06T06:36:15.097Z]   🖥 Fetch API cannot load https://www.recaptcha.net/recaptcha/enterprise/clr?k=6LfmcbcpAAAAAChNTbhUShzUOAMj_wY9LQIvLFX0. Refused to connect because it violates the document's Content Security Policy.
+[2026-06-06T06:36:15.098Z]   🖥 Connecting to 'https://www.recaptcha.net/recaptcha/enterprise/clr?k=6LfmcbcpAAAAAChNTbhUShzUOAMj_wY9LQIvLFX0' violates the following Content Security Policy directive: "connect-src 'self' api.mapbox.com docs.google.com/feeds/download/documents/export/Export *.amazonaws.com *.googleapis.com *.googleusercontent.com api.rollbar.com api.geocode.earth https://api-geocode-earth-proxy.greenhouse.io/ *.dropboxusercontent.com *.dropbox.com *.dropboxapi.com www.google.com auth.seek.com apply-api.gograyscale.com wss://apply-api-realtime.gograyscale.com apply.grsc.io https://prod-jben.prod-use1-0.gh.internal boards.greenhouse.io job-boards.cdn.greenhouse.io email-address-validator.us.greenhouse.io https://my.greenhouse.io c.spl.greenhouse.io". The action has been blocked.
+[2026-06-06T06:36:15.098Z]   🖥 Fetch API cannot load https://www.recaptcha.net/recaptcha/enterprise/clr?k=6LfmcbcpAAAAAChNTbhUShzUOAMj_wY9LQIvLFX0. Refused to connect because it violates the document's Content Security Policy.
+[2026-06-06T06:36:15.602Z]   🖥 Failed to load resource: the server responded with a status of 428 ()
+[2026-06-06T06:36:28.113Z]   ❌ Validation error
+[2026-06-06T06:36:28.125Z]   ⏳ Waiting 17s...
+[2026-06-06T06:36:45.393Z] 
+[2/10] Manager, AV Strategy & Business Operations at Lyft (greenhouse)
+[2026-06-06T06:36:45.393Z]   Score: 90% | Variant: default
+[2026-06-06T06:36:45.767Z]   🎯 Answer focus: Cross-functional team execution
+[2026-06-06T06:36:45.767Z]   🌐 https://boards.greenhouse.io/lyft/jobs/8538777002?gh_jid=8538777002#app
+[2026-06-06T06:36:47.885Z]   🖥 Error: Minified React error #418; visit https://reactjs.org/docs/error-decoder.html?invariant=418 for the full message or use the non-minified dev environment for full errors and additional helpful warnings.
+    at o1 (https://job-boards.cdn.greenhouse.io/assets/vendor-CrmIOWxE.js:38:4812)
+    at d9 (https://job-boards.cdn.greenhouse.io/assets/vendor-CrmIOWxE.js:40:45634)
+    at s9 (https://job-boards.cdn.greenhouse.io/assets/vendor-CrmIOWxE.js:40:39790)
+    at W8 (https://job-boards.cdn.greenhouse.io/assets/vendor-CrmIOWxE.js:40:39762)
+    at i9 (https://job-boards.cdn.greenhouse.io/assets/vendor-CrmIOWxE.js:40:34745)
+    at S (https://job-boards.cdn.greenhouse.io/assets/vendor-CrmIOWxE.js:25:1550)
+    at MessagePort.M (https://job-boards.cdn.greenhouse.io/assets/vendor-CrmIOWxE.js:25:1910)
+[2026-06-06T06:36:48.020Z]   🖥 Failed to load resource: the server responded with a status of 401 ()
+[2026-06-06T06:36:48.021Z]   🖥 JS error: Unauthorized: User is not logged in.
+[2026-06-06T06:36:58.605Z]   ⚠ Form not found after 12s — checking page state
+[2026-06-06T06:36:58.779Z]   📋 Deactivated custom-site company: Lyft
+[2026-06-06T06:36:58.876Z]   📋 Manual: Custom site: app.careerpuck.com
+[2026-06-06T06:36:58.884Z]   ⏳ Waiting 15s...
+[2026-06-06T06:37:13.959Z] 
+[3/10] Senior Sales Strategy & Operations Manager at Intercom (greenhouse)
+[2026-06-06T06:37:13.959Z]   Score: 90% | Variant: default
+[2026-06-06T06:37:14.273Z]   🎯 Answer focus: Operational framework construction
+[2026-06-06T06:37:14.273Z]   🌐 https://boards.greenhouse.io/intercom/jobs/7593439?gh_jid=7593439#app
+[2026-06-06T06:37:15.161Z]   🖥 Failed to load resource: the server responded with a status of 401 ()
+[2026-06-06T06:37:15.163Z]   🖥 JS error: Unauthorized: User is not logged in.
+[2026-06-06T06:37:16.411Z]   📄 Debug HTML saved (160026 chars)
+[2026-06-06T06:37:16.414Z]   📋 Form fields found: [{"id":"first_name","name":"","type":"text","placeholder":""},{"id":"last_name","name":"","type":"text","placeholder":""},{"id":"email","name":"","type":"text","placeholder":""},{"id":"country","name":"","type":"text","placeholder":""},{"id":"iti-0__search-input","name":"","type":"search","placeholder":"Search"},{"id":"phone","name":"","type":"tel","placeholder":""},{"id":"candidate-location","name":"","type":"text","placeholder":""},{"id":"resume","name":"","type":"file","placeholder":""},{"id":"cover_letter","name":"","type":"file","placeholder":""},{"id":"question_63274758","name":"","type":"text","placeholder":""},{"id":"question_63274759","name":"","type":"text","placeholder":""},{"id":"question_63274760","name":"","type":"text","placeholder":""},{"id":"question_63274761","name":"","type":"text","placeholder":""},{"id":"question_63274762","name":"","type":"text","placeholder":""},{"id":"question_63274763","name":"","type":"text","placeholder":""}]
+[2026-06-06T06:37:16.508Z]   🖥 Failed to load resource: the server responded with a status of 401 ()
+[2026-06-06T06:37:16.519Z]   🖥 JS error: Unauthorized: User is not logged in.
+[2026-06-06T06:37:21.432Z]   ✓ Location: San Mateo
+[2026-06-06T06:37:24.334Z]   ✓ Country: United States
+[2026-06-06T06:37:24.355Z]   📎 Cover letter uploaded
+[2026-06-06T06:37:24.356Z]   📥 Downloading resume...
+[2026-06-06T06:37:24.849Z]   💾 Resume ready: 143071 bytes at /tmp/aaron_resume.pdf
+[2026-06-06T06:37:24.852Z]   📎 Setting file on input: input[type="file"][id="resume"]
+[2026-06-06T06:37:26.362Z]   ✅ Resume uploaded via setInputFiles
+[2026-06-06T06:37:26.362Z]   📎 Resume PDF uploaded
+[2026-06-06T06:37:29.945Z]   ⚠ React dropdown error (elementHandle.click: Timeout 1500ms exce): Are you authorised to work in 
+[2026-06-06T06:37:29.962Z]   ✓ Text input: Current Location*
+[2026-06-06T06:37:31.194Z]   ✓ React dropdown [Yes]: Are you willing to relocate?*
+[2026-06-06T06:37:31.416Z]   ✓ Text input: Current or most recent company?*
+[2026-06-06T06:37:33.888Z]   ⚠ React dropdown error (elementHandle.click: Timeout 1500ms exce): Have you previously worked for
+[2026-06-06T06:37:33.908Z]   ✓ Text input: LinkedIn Profile
+[2026-06-06T06:37:33.932Z]   ✓ Text input: Website
+[2026-06-06T06:37:36.855Z]   ⚠ React dropdown error (elementHandle.click: Timeout 1500ms exce): How did you hear about this jo
+[2026-06-06T06:37:36.878Z]   ✓ Text input: What excites you most about this opportunity?
+[2026-06-06T06:37:36.897Z]   ✓ Text input: Which Fin value resonates most with you and why? (
+[2026-06-06T06:37:38.060Z]   ✓ React dropdown [Yes]: We work under a hybrid in-office model. 
+[2026-06-06T06:37:38.280Z]   ✓ Text input: Please email me about future job openings
+*
+[2026-06-06T06:37:39.276Z]   ✓ EEOC decline: gender
+[2026-06-06T06:37:40.576Z]   ✓ EEOC decline: hispanic_ethnicity
+[2026-06-06T06:37:41.895Z]   ✓ EEOC decline: veteran_status
+[2026-06-06T06:37:43.242Z]   ✓ EEOC decline: disability_status
+[2026-06-06T06:37:44.716Z]   🖱 Submitting...
+[2026-06-06T06:37:58.631Z]   📋 Validation errors: Are you authorised to work in the country in which this role is located? 
+(Fin sponsors immigration for some roles so we encourage you to still apply if you require sponsorship.)* | Select... | This field is required. | Current Location* | Select... | This field is required. | Have you previously worked for Fin (formerly Intercom)?* | Select... | This field is required. | How did you hear about this job?*
+[2026-06-06T06:37:58.869Z]   ❌ Needs custom answers: 
+[2026-06-06T06:37:58.881Z]   ⏳ Waiting 18s...
+[2026-06-06T06:38:17.184Z] 
+[4/10] Finance Business Operations Manager at Lyft (greenhouse)
+[2026-06-06T06:38:17.184Z]   Score: 90% | Variant: default
+[2026-06-06T06:38:17.670Z]   🎯 Answer focus: Operational framework construction
+[2026-06-06T06:38:17.670Z]   🌐 https://boards.greenhouse.io/lyft/jobs/8574940002?gh_jid=8574940002#app
+[2026-06-06T06:38:19.777Z]   🖥 Error: Minified React error #418; visit https://reactjs.org/docs/error-decoder.html?invariant=418 for the full message or use the non-minified dev environment for full errors and additional helpful warnings.
+    at o1 (https://job-boards.cdn.greenhouse.io/assets/vendor-CrmIOWxE.js:38:4812)
+    at d9 (https://job-boards.cdn.greenhouse.io/assets/vendor-CrmIOWxE.js:40:45634)
+    at s9 (https://job-boards.cdn.greenhouse.io/assets/vendor-CrmIOWxE.js:40:39790)
+    at W8 (https://job-boards.cdn.greenhouse.io/assets/vendor-CrmIOWxE.js:40:39762)
+    at i9 (https://job-boards.cdn.greenhouse.io/assets/vendor-CrmIOWxE.js:40:34745)
+    at S (https://job-boards.cdn.greenhouse.io/assets/vendor-CrmIOWxE.js:25:1550)
+    at MessagePort.M (https://job-boards.cdn.greenhouse.io/assets/vendor-CrmIOWxE.js:25:1910)
+[2026-06-06T06:38:20.047Z]   🖥 Failed to load resource: the server responded with a status of 401 ()
+[2026-06-06T06:38:20.142Z]   🖥 JS error: Unauthorized: User is not logged in.
+[2026-06-06T06:38:30.562Z]   ⚠ Form not found after 12s — checking page state
+[2026-06-06T06:38:30.718Z]   📋 Deactivated custom-site company: Lyft
+[2026-06-06T06:38:30.809Z]   📋 Manual: Custom site: app.careerpuck.com
+[2026-06-06T06:38:30.820Z]   ⏳ Waiting 16s...
+[2026-06-06T06:38:47.235Z] 
+[5/10] GTM Strategy & Operations Lead at Faire (greenhouse)
+[2026-06-06T06:38:47.235Z]   Score: 90% | Variant: default
+[2026-06-06T06:38:47.500Z]   🎯 Answer focus: Revenue efficiency
+[2026-06-06T06:38:47.500Z]   🌐 https://boards.greenhouse.io/faire/jobs/8502816002?gh_jid=8502816002#app
+[2026-06-06T06:38:48.488Z]   🖥 Failed to load resource: the server responded with a status of 401 ()
+[2026-06-06T06:38:48.488Z]   🖥 JS error: Unauthorized: User is not logged in.
+[2026-06-06T06:38:49.864Z]   📄 Debug HTML saved (164466 chars)
+[2026-06-06T06:38:49.868Z]   📋 Form fields found: [{"id":"first_name","name":"","type":"text","placeholder":""},{"id":"last_name","name":"","type":"text","placeholder":""},{"id":"preferred_name","name":"","type":"text","placeholder":""},{"id":"email","name":"","type":"text","placeholder":""},{"id":"country","name":"","type":"text","placeholder":""},{"id":"iti-0__search-input","name":"","type":"search","placeholder":"Search"},{"id":"phone","name":"","type":"tel","placeholder":""},{"id":"candidate-location","name":"","type":"text","placeholder":""},{"id":"resume","name":"","type":"file","placeholder":""},{"id":"cover_letter","name":"","type":"file","placeholder":""},{"id":"question_36092581002","name":"","type":"text","placeholder":""},{"id":"question_36092582002","name":"","type":"text","placeholder":""},{"id":"question_36092583002","name":"","type":"text","placeholder":""},{"id":"question_36092584002","name":"","type":"text","placeholder":""},{"id":"question_36092585002","name":"","type":"text","placeholder".
+[2026-06-06T06:38:49.961Z]   🖥 Failed to load resource: the server responded with a status of 401 ()
+[2026-06-06T06:38:49.983Z]   🖥 JS error: Unauthorized: User is not logged in.
+[2026-06-06T06:38:55.327Z]   ✓ Location: San Mateo
+[2026-06-06T06:38:58.228Z]   ✓ Country: United States
+[2026-06-06T06:38:58.249Z]   📎 Cover letter uploaded
+[2026-06-06T06:38:58.249Z]   📥 Downloading resume...
+[2026-06-06T06:38:58.701Z]   💾 Resume ready: 143071 bytes at /tmp/aaron_resume.pdf
+[2026-06-06T06:38:58.704Z]   📎 Setting file on input: input[type="file"][id="resume"]
+[2026-06-06T06:39:00.214Z]   ✅ Resume uploaded via setInputFiles
+[2026-06-06T06:39:00.214Z]   📎 Resume PDF uploaded
+[2026-06-06T06:39:01.493Z]   ✓ Text input: LinkedIn Profile
+[2026-06-06T06:39:01.535Z]   ✓ Text input: Website
+[2026-06-06T06:39:04.436Z]   ⚠ React dropdown error (elementHandle.click: Timeout 1500ms exce): Are you currently based in San
+[2026-06-06T06:39:04.456Z]   ✓ Text input: What makes you a great fit for this role?*
+[2026-06-06T06:39:05.689Z]   ✓ React dropdown [California]: Please select your current state of resi
+[2026-06-06T06:39:07.073Z]   ✓ React dropdown [Yes]: Do you have advanced knowledge of SQL?*
+[2026-06-06T06:39:08.422Z]   ✓ React dropdown [Yes]: This role will be in-office on a hybrid 
+[2026-06-06T06:39:08.638Z]   ✓ Text input: Before seeing this job posting, how familiar were 
+[2026-06-06T06:39:11.340Z]   ⚠ React dropdown error (elementHandle.click: Timeout 1500ms exce): Do you consider yourself a mem
+[2026-06-06T06:39:11.356Z]   ✓ Text input: Which categories describe you? Select all that app
+[2026-06-06T06:39:14.010Z]   ⚠ React dropdown error (elementHandle.click: Timeout 1500ms exce): How do you currently describe 
+[2026-06-06T06:39:17.028Z]   ⚠ React dropdown error (elementHandle.click: Timeout 3000ms exce): Do you identify as a military 
+[2026-06-06T06:39:20.061Z]   ⚠ React dropdown error (elementHandle.click: Timeout 3000ms exce): Are you a person living with a
+[2026-06-06T06:39:21.711Z]   🖱 Submitting...
+[2026-06-06T06:39:35.165Z]   📋 Validation errors: Are you currently based in San Francisco or planning to move there?* | Select... | This field is required. | Before seeing this job posting, how familiar were you with Faire as a company? (Your response will not impact your application)* | Select... | This field is required. | How did you hear about Faire? (Select all that apply) * | This field is required. | Do you consider yourself a member of the LGBTQIA+ community? * | Select...
+[2026-06-06T06:39:35.343Z]   ❌ Needs custom answers: 
+[2026-06-06T06:39:35.352Z]   ⏳ Waiting 15s...
+[2026-06-06T06:39:50.263Z] 
+[6/10] Revenue Operations Lead at Affirm (greenhouse)
+[2026-06-06T06:39:50.263Z]   Score: 90% | Variant: default
+[2026-06-06T06:39:50.673Z]   🎯 Answer focus: Cross-functional team execution
+[2026-06-06T06:39:50.673Z]   🌐 https://boards.greenhouse.io/affirm/jobs/7686481003?gh_jid=7686481003#app
+[2026-06-06T06:39:51.631Z]   🖥 Failed to load resource: the server responded with a status of 401 ()
+[2026-06-06T06:39:51.638Z]   🖥 JS error: Unauthorized: User is not logged in.
+[2026-06-06T06:39:52.779Z]   📄 Debug HTML saved (140862 chars)
+[2026-06-06T06:39:52.781Z]   📋 Form fields found: [{"id":"first_name","name":"","type":"text","placeholder":""},{"id":"last_name","name":"","type":"text","placeholder":""},{"id":"email","name":"","type":"text","placeholder":""},{"id":"country","name":"","type":"text","placeholder":""},{"id":"iti-0__search-input","name":"","type":"search","placeholder":"Search"},{"id":"phone","name":"","type":"tel","placeholder":""},{"id":"resume","name":"","type":"file","placeholder":""},{"id":"cover_letter","name":"","type":"file","placeholder":""},{"id":"question_30289054003","name":"","type":"text","placeholder":""},{"id":"question_30289055003","name":"","type":"text","placeholder":""},{"id":"question_30289056003","name":"","type":"text","placeholder":""},{"id":"question_30289057003","name":"","type":"text","placeholder":""},{"id":"question_30289058003","name":"","type":"text","placeholder":""},{"id":"question_30289059003","name":"","type":"text","placeholder":""},{"id":"question_30289060003","name":"","type":"text","plac.
+[2026-06-06T06:39:52.874Z]   🖥 Failed to load resource: the server responded with a status of 401 ()
+[2026-06-06T06:39:52.889Z]   🖥 JS error: Unauthorized: User is not logged in.
+[2026-06-06T06:39:58.276Z]   ✓ Country: United States
+[2026-06-06T06:39:58.297Z]   📎 Cover letter uploaded
+[2026-06-06T06:39:58.297Z]   📥 Downloading resume...
+[2026-06-06T06:39:58.525Z]   💾 Resume ready: 143071 bytes at /tmp/aaron_resume.pdf
+[2026-06-06T06:39:58.528Z]   📎 Setting file on input: input[type="file"][id="resume"]
+[2026-06-06T06:40:00.035Z]   ✅ Resume uploaded via setInputFiles
+[2026-06-06T06:40:00.035Z]   📎 Resume PDF uploaded
+[2026-06-06T06:40:00.849Z]   ✓ Text input: LinkedIn Profile
+[2026-06-06T06:40:00.867Z]   ✓ Text input: Current Company
+[2026-06-06T06:40:00.878Z]   ⚠ No css- trigger found, trying direct click: Preferred Name*
+[2026-06-06T06:40:02.651Z]   ✓ Text input: Name Pronunciation
+[2026-06-06T06:40:03.920Z]   ✓ React dropdown [Decline]: Pronouns
+*
+[2026-06-06T06:40:05.254Z]   ✓ React dropdown [Yes]: Are you legally authorized to work in th
+[2026-06-06T06:40:07.882Z]   ⚠ React dropdown error (elementHandle.click: Timeout 1500ms exce): Do you now or in the future re
+[2026-06-06T06:40:10.908Z]   ⚠ React dropdown error (elementHandle.click: Timeout 3000ms exce): Which U.S. State or Canadian P
+[2026-06-06T06:40:13.002Z]   ✓ React dropdown [LinkedIn]:  How did you first learn about Affirm as
+[2026-06-06T06:40:13.221Z]   ✓ Text input: GitHub
+[2026-06-06T06:40:13.242Z]   ✓ Text input:  Twitter
+[2026-06-06T06:40:13.260Z]   ✓ Text input: Portfolio
+[2026-06-06T06:40:13.277Z]   ✓ Text input: Other Links
+[2026-06-06T06:40:15.935Z]   ⚠ React dropdown error (elementHandle.click: Timeout 1500ms exce): Have you previously been emplo
+[2026-06-06T06:40:17.086Z]   ✓ React dropdown [Decline]: How do you identify? (gender identity)
+[2026-06-06T06:40:18.437Z]   ✓ React dropdown [Decline]: How do you identify? (race/ethnicity)
+[2026-06-06T06:40:20.743Z]   🖱 Submitting...
+[2026-06-06T06:40:33.694Z]   📋 Validation errors: Preferred Name* | Preferred Name* | This field is required. | Do you now or in the future require sponsorship for employment visa status (e.g., H-1B, TN, E-3, F-1 visa status)?* | Select... | This field is required. | Which U.S. State or Canadian Province do you reside in?* | Select... | This field is required. | Have you previously been employed at Affirm for any length of time?*
+[2026-06-06T06:40:33.866Z]   ❌ Validation: Preferred Name*, Preferred Name*, This field is required.
+[2026-06-06T06:40:33.876Z]   ⏳ Waiting 16s...
+[2026-06-06T06:40:50.089Z] 
+[7/10] Growth Strategy & Operations Lead at Airbnb (greenhouse)
+[2026-06-06T06:40:50.089Z]   Score: 90% | Variant: default
+[2026-06-06T06:40:50.524Z]   🎯 Answer focus: Operational framework construction
+[2026-06-06T06:40:50.524Z]   🌐 https://boards.greenhouse.io/airbnb/jobs/7957137?gh_jid=7957137#app
+[2026-06-06T06:40:52.669Z]   🖥 Failed to load resource: the server responded with a status of 401 ()
+[2026-06-06T06:40:52.672Z]   🖥 JS error: Unauthorized: User is not logged in.
+[2026-06-06T06:41:03.970Z]   ⚠ Form not found after 12s — checking page state
+[2026-06-06T06:41:04.129Z]   📋 Deactivated custom-site company: Airbnb
+[2026-06-06T06:41:04.221Z]   📋 Manual: Custom site: careers.airbnb.com
+[2026-06-06T06:41:04.229Z]   ⏳ Waiting 16s...
+[2026-06-06T06:41:20.720Z] 
+[8/10] People Strategy & Operations Lead - Contract at Fivetran (greenhouse)
+[2026-06-06T06:41:20.720Z]   Score: 90% | Variant: default
+[2026-06-06T06:41:21.000Z]   🎯 Answer focus: Quantitative scale metrics
+[2026-06-06T06:41:21.000Z]   🌐 https://boards.greenhouse.io/fivetran/jobs/7705026003?gh_jid=7705026003#app
+[2026-06-06T06:41:22.991Z]   🖥 Failed to load resource: the server responded with a status of 401 ()
+[2026-06-06T06:41:22.992Z]   🖥 JS error: Unauthorized: User is not logged in.
+[2026-06-06T06:41:34.766Z]   ⚠ Form not found after 12s — checking page state
+[2026-06-06T06:41:34.898Z]   📋 Deactivated custom-site company: Fivetran
+[2026-06-06T06:41:34.976Z]   📋 Manual: Custom site: www.fivetran.com
+[2026-06-06T06:41:34.983Z]   ⏳ Waiting 13s...
+[2026-06-06T06:41:47.500Z] 
+[9/10] Professional Services Operations Manager at Intercom (greenhouse)
+[2026-06-06T06:41:47.500Z]   Score: 82% | Variant: default
+[2026-06-06T06:41:47.811Z]   🎯 Answer focus: Quantitative scale metrics
+[2026-06-06T06:41:47.812Z]   🌐 https://boards.greenhouse.io/intercom/jobs/7728811?gh_jid=7728811#app
+[2026-06-06T06:41:48.485Z]   🖥 Failed to load resource: the server responded with a status of 401 ()
+[2026-06-06T06:41:48.486Z]   🖥 JS error: Unauthorized: User is not logged in.
+[2026-06-06T06:41:49.821Z]   📄 Debug HTML saved (142516 chars)
+[2026-06-06T06:41:49.823Z]   📋 Form fields found: [{"id":"first_name","name":"","type":"text","placeholder":""},{"id":"last_name","name":"","type":"text","placeholder":""},{"id":"preferred_name","name":"","type":"text","placeholder":""},{"id":"email","name":"","type":"text","placeholder":""},{"id":"country","name":"","type":"text","placeholder":""},{"id":"iti-0__search-input","name":"","type":"search","placeholder":"Search"},{"id":"phone","name":"","type":"tel","placeholder":""},{"id":"resume","name":"","type":"file","placeholder":""},{"id":"cover_letter","name":"","type":"file","placeholder":""},{"id":"question_64616246","name":"","type":"text","placeholder":""},{"id":"question_64616247","name":"","type":"text","placeholder":""},{"id":"question_64616248","name":"","type":"text","placeholder":""},{"id":"question_64616249","name":"","type":"text","placeholder":""},{"id":"question_64616250","name":"","type":"text","placeholder":""},{"id":"question_64616251","name":"","type":"text","placeholder":""}]
+[2026-06-06T06:41:49.905Z]   🖥 Failed to load resource: the server responded with a status of 401 ()
+[2026-06-06T06:41:49.928Z]   🖥 JS error: Unauthorized: User is not logged in.
+[2026-06-06T06:41:55.459Z]   ✓ Country: United States
+[2026-06-06T06:41:55.479Z]   📎 Cover letter uploaded
+[2026-06-06T06:41:55.479Z]   📥 Downloading resume...
+[2026-06-06T06:41:55.853Z]   💾 Resume ready: 143071 bytes at /tmp/aaron_resume.pdf
+[2026-06-06T06:41:55.857Z]   📎 Setting file on input: input[type="file"][id="resume"]
+[2026-06-06T06:41:57.365Z]   ✅ Resume uploaded via setInputFiles
+[2026-06-06T06:41:57.365Z]   📎 Resume PDF uploaded
+[2026-06-06T06:42:00.636Z]   ⚠ React dropdown error (elementHandle.click: Timeout 1500ms exce): Are you authorised to work in 
+[2026-06-06T06:42:00.652Z]   ✓ Text input: Current Location*
+[2026-06-06T06:42:01.833Z]   ✓ React dropdown [Yes]: Are you willing to relocate?*
+[2026-06-06T06:42:02.052Z]   ✓ Text input: Current or most recent company?*
+[2026-06-06T06:42:04.489Z]   ⚠ React dropdown error (elementHandle.click: Timeout 1500ms exce): Have you previously worked for
+[2026-06-06T06:42:04.507Z]   ✓ Text input: LinkedIn Profile
+[2026-06-06T06:42:04.525Z]   ✓ Text input: Website
+[2026-06-06T06:42:07.217Z]   ⚠ React dropdown error (elementHandle.click: Timeout 1500ms exce): How did you hear about this jo
+[2026-06-06T06:42:07.237Z]   ✓ Text input: What excites you most about this opportunity?
+[2026-06-06T06:42:07.256Z]   ✓ Text input: Which Fin value resonates most with you and why? (
+[2026-06-06T06:42:08.413Z]   ✓ React dropdown [Yes]: We work under a hybrid in-office model. 
+[2026-06-06T06:42:08.628Z]   ✓ Text input: Please email me about future job openings
+*
+[2026-06-06T06:42:10.403Z]   🖱 Submitting...
+[2026-06-06T06:42:23.690Z]   📋 Validation errors: Are you authorised to work in the country in which this role is located? 
+(Fin sponsors immigration for some roles so we encourage you to still apply if you require sponsorship.)* | Select... | This field is required. | Current Location* | Select... | This field is required. | Have you previously worked for Fin (formerly Intercom)?* | Select... | This field is required. | How did you hear about this job?*
+[2026-06-06T06:42:23.859Z]   ❌ Needs custom answers: 
+[2026-06-06T06:42:23.868Z]   ⏳ Waiting 16s...
+[2026-06-06T06:42:40.100Z] 
+[10/10] User Operations Manager, US at Harvey (ashby)
+[2026-06-06T06:42:40.100Z]   Score: 82% | Variant: default
+[2026-06-06T06:42:40.589Z]   🎯 Answer focus: Operational framework construction
+[2026-06-06T06:42:40.589Z]   🌐 https://jobs.ashbyhq.com/harvey/25142ed9-88af-4bc4-b458-22179020b563/application
+[2026-06-06T06:42:44.386Z]   📥 Downloading resume...
+[2026-06-06T06:42:44.449Z]   💾 Resume ready: 143071 bytes at /tmp/aaron_resume.pdf
+[2026-06-06T06:42:44.452Z]   📎 Setting file on input: input[type="file"]
+[2026-06-06T06:42:45.962Z]   ✅ Resume uploaded via setInputFiles
+[2026-06-06T06:43:02.533Z]   📍 https://jobs.ashbyhq.com/harvey/25142ed9-88af-4bc4-b458-22179020b563/application
+[2026-06-06T06:43:02.541Z]   ⚠ Still on /application page — form may not have submitted
+[2026-06-06T06:43:02.571Z]   📋 Ashby validation errors: Your form needs correctionsMissing entry for required field: Legal First and Last NameMissing entry for required field: Preferred First NameMissing entry for required field: Preferred Last NameMissing entry for required field: LocationMissing entry for required field: Current or Most Recent EmployerMissing entry for required field: Are you legally authorized to work in the country where this role is located, for any employer?Missing entry for required field: Will you now or will you in the future require employment visa sponsorship?Missing entry for required field: This role is tied to the office location listed in the job posting. Team members are expected to work from the office 3 days per week as part of Harvey’s hybrid work model. Are you currently based in the listed location and able to work in person 3 days per week?Missing entry for required field: LinkedIn | Missing entry for required field: Legal First and Last NameMissing entry for required f.
+[2026-06-06T06:43:03.268Z]   ❌ Ashby: no confirmation at https://jobs.ashbyhq.com/harvey/25142ed9-88af-4bc4-b458-22179020b563/application
+[2026-06-06T06:43:03.302Z] 
+────────────────────────────────
+[2026-06-06T06:43:03.302Z] ✅ Submitted:  0
+[2026-06-06T06:43:03.302Z] ♻ Duplicate:  0
+[2026-06-06T06:43:03.303Z] ❌ Failed:     6
+[2026-06-06T06:43:03.303Z] 📋 Manual:     4
+[2026-06-06T06:43:03.303Z] ⏭ Skipped:    0
+[2026-06-06T06:43:03.303Z] 
+📝 Run log saved
+1s
+Run actions/upload-artifact@v4
+Multiple search paths detected. Calculating the least common ancestor of all paths
+The least common ancestor is /. This will be the root directory of the artifact
+With the provided path, there will be 2 files uploaded
+Artifact name is valid!
+Root directory input is valid!
+Beginning upload of artifact content to blob storage
+Uploaded bytes 19447
+Finished uploading artifact content to blob storage!
+SHA256 digest of uploaded artifact zip is 3493bbd5db0b5a16049792bb8f2ef498cc5cb52581ed922ffb9b05feec48515b
+Finalizing artifact upload
+Artifact submission-log-27055142638.zip successfully finalized. Artifact ID 7452081955
+Artifact submission-log-27055142638 has been successfully uploaded! Final size is 19447 bytes. Artifact ID is 7452081955
+Artifact download URL: https://github.com/afilous/job-autopilot/actions/runs/27055142638/artifacts/7452081955
+0s
+Post job cleanup.
+0s
+Post job cleanup.
+/usr/bin/git version
+git version 2.54.0
+Temporarily overriding HOME='/home/runner/work/_temp/42adbff3-558c-4e8f-8702-ae194ed12d07' before making global git config changes
+Adding repository directory to the temporary git global config as a safe directory
+/usr/bin/git config --global --add safe.directory /home/runner/work/job-autopilot/job-autopilot
+/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+http.https://github.com/.extraheader
+/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+0s

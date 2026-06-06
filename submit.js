@@ -757,7 +757,8 @@ linkedin.com/in/aaron-filous`;
         }).catch(() => '');
 
         await wrapper.scrollIntoViewIfNeeded().catch(() => {});
-        await wrapper.click({ timeout: 2000, force: false }).catch(() => { continue; });
+        const clicked = await wrapper.click({ timeout: 2000 }).then(() => true).catch(() => false);
+        if (!clicked) continue;
         await page.waitForTimeout(500);
 
         // Pick option based on context

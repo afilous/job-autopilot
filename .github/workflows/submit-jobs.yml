@@ -30,6 +30,9 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
+          GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
+          GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
         run: node submit.js
 
       - name: Upload run log and debug files
@@ -40,4 +43,7 @@ jobs:
           path: |
             run-log.json
             /tmp/greenhouse-debug.html
+            /tmp/greenhouse-debug.png
+            /tmp/lever-debug.png
+            /tmp/ashby-debug.png
           retention-days: 30

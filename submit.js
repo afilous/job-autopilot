@@ -65,6 +65,16 @@ function randomFocus() { return FOCUS_ELEMENTS[Math.floor(Math.random() * FOCUS_
 async function main() {
   log(DRY_RUN ? '🔍 DRY RUN mode' : '🚀 Starting job submission run');
 
+  // Recovery: release any jobs stuck in 'processing' for more than 30 minutes
+  // This happens when GitHub Actions crashes or times out mid-run
+  const staleWindow = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+  const { error: rollbackError, count: rollbackCount } = await supabase
+    .from('applications')
+    .update({ status: 'queued', notes: 'Auto-recovered from stale processing state' })
+    .eq('status', 'processing')
+    .lt('started_at', staleWindow);
+  if (!rollbackError && rollbackCount > 0) log('♻ Recovered ' + rollbackCount + ' stale jobs back to queued');
+
   // Fetch queued jobs
   const { data: jobs, error } = await supabase
     .from('applications')
@@ -265,13 +275,16 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
     log(`  🌐 ${applyUrl}`);
     await page.goto(applyUrl, { waitUntil: 'load', timeout: 30000 });
     
-    // Wait for React to fully hydrate
+    // Wait for form to fully render
     try {
-      await page.waitForSelector('#first_name, input[name="job_application[first_name]"], input[placeholder*="First" i]', { state: 'visible', timeout: 15000 });
+      await page.waitForSelector(
+        '#application_form, #app, #first_name, input[id="first_name"]',
+        { state: 'visible', timeout: 12000 }
+      );
+      await page.waitForTimeout(1500);
     } catch (e) {
-      log(`  ⚠ Form fields not found after 15s — checking page state`);
+      log('  ⚠ Form not found after 12s — checking page state');
     }
-    await page.waitForTimeout(3000); // Extra hydration buffer
 
     const finalUrl = page.url();
     const finalDomain = new URL(finalUrl).hostname;
@@ -366,6 +379,29 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
       if (await humanType(page, sel, PROFILE.website)) break;
     }
 
+    // Upload cover letter if field exists (required or not)
+    try {
+      const coverLetterInput = await page.$('input[type="file"][id="cover_letter"]');
+      if (coverLetterInput) {
+        const clPath = '/tmp/aaron_cover_letter.txt';
+        const clText = `Dear Hiring Manager,
+
+I am excited to apply for this role. With 10+ years in strategy and operations — including leading a $200M portfolio consolidation at Enova International and scaling Product School from $2M to $6M in revenue — I bring a proven track record of driving operational excellence and business growth.
+
+My experience spans cross-functional leadership, GTM strategy, revenue operations, and building scalable systems that deliver measurable impact. I am confident my background aligns strongly with the needs of this role and I look forward to contributing to your team.
+
+Please find additional details in my attached resume.
+
+Best regards,
+Aaron Filous
+filousaaron@gmail.com | (650) 291-3142
+linkedin.com/in/aaron-filous`;
+        fs.writeFileSync(clPath, clText);
+        await coverLetterInput.setInputFiles(clPath);
+        log('  📎 Cover letter uploaded');
+      }
+    } catch(e) { log('  ⚠ Cover letter: ' + e.message); }
+
     // Upload resume PDF
     let resumeUploaded = false;
     if (resumePdfUrl) {
@@ -396,6 +432,38 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
     // Work authorization radio buttons
     await handleRadioByText(page, /authorized.*work|work.*authorized|eligible.*work/i, /^Yes$/i);
     await handleRadioByText(page, /require.*sponsorship|visa sponsor|need.*sponsor/i, /^No$/i);
+
+    // Broader radio sweep for willing/authorized/in-person questions
+    try {
+      const allFields = await page.$$('div.field, div[class*="field"]');
+      for (const field of allFields) {
+        const fieldText = (await field.textContent() || '').toLowerCase();
+        if (/willing|authorized|legally|currently.*us|relocate|in.person|on.?site/i.test(fieldText)) {
+          const labels = await field.$$('label');
+          for (const label of labels) {
+            const lt = (await label.textContent() || '').toLowerCase().trim();
+            if (lt === 'yes' || lt === 'true' || lt === 'i am' || lt === 'willing') {
+              await label.click();
+              log('  ✓ Radio Yes: ' + fieldText.slice(0, 40));
+              break;
+            }
+          }
+        }
+        if (/sponsorship|visa|sponsor/i.test(fieldText)) {
+          const labels = await field.$$('label');
+          for (const label of labels) {
+            const lt = (await label.textContent() || '').toLowerCase().trim();
+            if (lt === 'no' || lt === 'false' || lt === 'i do not') {
+              await label.click();
+              log('  ✓ Radio No: ' + fieldText.slice(0, 40));
+              break;
+            }
+          }
+        }
+      }
+    } catch(e) {
+      log('  ⚠ Radio sweep: ' + e.message);
+    }
 
     // Work authorization dropdowns
     await handleDropdownByText(page, /authorized.*work|work.*authorized/i, 'Yes');
@@ -468,6 +536,18 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
           }
         }
 
+        // Salary / compensation fields
+        if (/salary|compensation|pay expectation|expected.*pay/i.test(labelText)) {
+          const el = await page.$(`[id="${forAttr}"]`);
+          if (el) {
+            const tag = await el.evaluate(e => e.tagName.toLowerCase());
+            if (tag === 'input' || tag === 'textarea') {
+              await el.fill('145000');
+              log('  ✓ Salary: 145000');
+            }
+          }
+        }
+
         // How did you hear
         if (/hear about|source|referred/.test(labelText)) {
           const el = await page.$(`[id="${forAttr}"]`);
@@ -482,8 +562,8 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
 
         // Custom text questions (question_XXXXXXX pattern)
         if (forAttr.startsWith('question_') || /^\d/.test(forAttr)) {
-          const safeId = forAttr.replace(/(:|\.|\[|\]|,|=|@)/g, '\\$1');
-          const el = await page.$(`#${safeId}`) || await page.$(`[id="${forAttr}"]`);
+          // Always use attribute selector — CSS ID selectors can't start with digits
+          const el = await page.$(`[id="${forAttr}"]`);
           if (!el) continue;
           const tag = await el.evaluate(e => e.tagName.toLowerCase());
           const type = await el.evaluate(e => e.type || '');
@@ -510,6 +590,21 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
     } catch (e) {
       log(`  ⚠ Custom field error: ${e.message}`);
     }
+
+    // EEOC / Diversity self-identification — decline all to avoid missing field errors
+    try {
+      const allLabels = await page.$$('label');
+      for (const label of allLabels) {
+        const text = (await label.innerText() || '').toLowerCase();
+        if (text.includes('decline to self-identify') || 
+            text.includes('i do not wish to answer') ||
+            text.includes('prefer not to say') ||
+            text.includes('decline to identify') ||
+            text.includes('i do not wish to disclose')) {
+          await label.click();
+        }
+      }
+    } catch(e) {}
 
     // Submit button — scroll → hover → humanized click
     const submitBtn = page.locator('#submit_app, input[type="submit"][value*="Submit" i], button[type="submit"]').first();
@@ -861,8 +956,7 @@ async function tryFillByLabel(page, labelText, value) {
       if (text && text.toLowerCase().includes(labelText.toLowerCase().slice(0, 25))) {
         const forAttr = await label.getAttribute('for');
         if (forAttr) {
-          const safeForId = forAttr.replace(/(:|\.|\[|\]|,|=|@)/g, '\\$1');
-        const input = await page.$(`#${safeForId}`) || await page.$(`[id="${forAttr}"]`);
+          const input = await page.$(`[id="${forAttr}"]`);
           if (input) {
             const tag = await input.evaluate(el => el.tagName.toLowerCase());
             const type = await input.evaluate(el => el.type || '');

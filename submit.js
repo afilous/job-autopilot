@@ -620,52 +620,45 @@ linkedin.com/in/aaron-filous`;
             log('  ✓ Native select: ' + labelText.slice(0, 40));
 
           } else if (isReactDropdown) {
-            // React/custom dropdown — click the visible trigger, then pick option
+            // React/custom dropdown — click visible trigger with short timeout, fall back to force-inject
+            
+            // Determine what to pick
+            let pickText = 'Yes';
+            if (/state/i.test(labelLower)) pickText = 'California';
+            else if (/hear|source|refer/i.test(labelLower)) pickText = 'LinkedIn';
+            else if (/sponsor|visa/i.test(labelLower)) pickText = 'No';
+            else if (/gender|race|ethnic|veteran|disability|lgbtq|sexual/i.test(labelLower)) pickText = 'Decline';
+            else if (/metro|based in|relocat|san francisco/i.test(labelLower)) pickText = 'San Francisco Bay';
+            else if (/familiar/i.test(labelLower)) pickText = null;
+            else if (/sql|experience|years/i.test(labelLower)) pickText = 'Yes';
+            else if (/ai tool|artificial intelligence/i.test(labelLower)) pickText = 'Yes';
+            else if (/previously worked|before|formerly/i.test(labelLower)) pickText = 'No';
+            else if (/non.compete|agreement|solicit/i.test(labelLower)) pickText = 'No';
+            else if (/hybrid|in.office|in.person|office/i.test(labelLower)) pickText = 'Yes';
+
             try {
-              // Find the visible clickable element near the hidden input
-              const clickTarget = await page.evaluate((id) => {
-                const el = document.getElementById(id);
-                if (!el) return null;
-                // Try parent chain for clickable dropdown trigger
-                let p = el.parentElement;
-                for (let i = 0; i < 5; i++) {
-                  if (!p) break;
-                  if (p.getAttribute('role') === 'combobox' || 
-                      (p.className && (p.className.includes('select') || p.className.includes('dropdown') || p.className.includes('Select')))) {
-                    return p.id || p.className.split(' ')[0];
-                  }
-                  p = p.parentElement;
-                }
-                return null;
-              }, forAttr).catch(() => null);
+              // Visibility check first — skip if element isn't interactable
+              const isVisible = await el.isVisible().catch(() => false);
+              const isEnabled = await el.isEnabled().catch(() => false);
+              
+              if (!isVisible || !isEnabled) {
+                // Try force-inject directly
+                throw new Error('not visible/enabled');
+              }
 
-              // Click the dropdown trigger
+              // Short timeout click — don't let it hang
               await el.scrollIntoViewIfNeeded();
-              await el.click().catch(() => {});
-              await page.waitForTimeout(500);
+              await el.click({ timeout: 2000 });
+              await page.waitForTimeout(400);
 
-              // Determine what to pick
-              let pickText = 'Yes';
-              if (/state/i.test(labelLower)) pickText = 'California';
-              else if (/hear|source|refer/i.test(labelLower)) pickText = 'LinkedIn';
-              else if (/sponsor|visa/i.test(labelLower)) pickText = 'No';
-              else if (/gender|race|ethnic|veteran|disability|lgbtq|sexual/i.test(labelLower)) pickText = 'Decline';
-              else if (/metro|based in|relocat|san francisco/i.test(labelLower)) pickText = 'San Francisco';
-              else if (/familiar/i.test(labelLower)) pickText = null; // pick first
-              else if (/sql|experience|years/i.test(labelLower)) pickText = 'Yes';
-              else if (/ai tool|artificial intelligence/i.test(labelLower)) pickText = 'Yes';
-              else if (/previously worked|before/i.test(labelLower)) pickText = 'No';
-              else if (/non.compete|agreement|solicit/i.test(labelLower)) pickText = 'No';
-              else if (/hybrid|in.office|in.person|office/i.test(labelLower)) pickText = 'Yes';
-
-              // Find and click option in the opened dropdown
-              const options = await page.$$('[role="option"], li[class*="option"], ul[role="listbox"] li, .select__option, [class*="menu"] li');
+              // Find options in opened dropdown
+              const options = await page.$$('[role="option"], li[class*="option"], ul[role="listbox"] li, .select__option');
               let picked = false;
               if (pickText) {
                 for (const opt of options) {
                   const optText = (await opt.innerText().catch(() => '')).trim();
                   if (optText.toLowerCase().includes(pickText.toLowerCase())) {
-                    await opt.click();
+                    await opt.click({ timeout: 1500 });
                     picked = true;
                     log('  ✓ React dropdown: ' + optText.slice(0, 40));
                     break;
@@ -673,19 +666,36 @@ linkedin.com/in/aaron-filous`;
                 }
               }
               if (!picked) {
-                // Pick first non-empty, non-placeholder option
                 for (const opt of options) {
                   const optText = (await opt.innerText().catch(() => '')).trim();
                   if (optText && !optText.toLowerCase().includes('select') && !optText.toLowerCase().includes('choose') && !optText.toLowerCase().includes('not in the us')) {
-                    await opt.click();
+                    await opt.click({ timeout: 1500 });
                     log('  ✓ React dropdown (first): ' + optText.slice(0, 40));
                     break;
                   }
                 }
               }
               await page.waitForTimeout(300);
+
             } catch(e) {
-              log('  ⚠ React dropdown error: ' + e.message.slice(0, 60));
+              // Force-inject value directly into React state
+              try {
+                const injectValue = pickText || 'Yes';
+                await el.evaluate((node, val) => {
+                  if (node.tagName.toLowerCase() === 'select') {
+                    node.value = val;
+                  } else {
+                    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    if (nativeInputValueSetter) nativeInputValueSetter.call(node, val);
+                    else node.setAttribute('value', val);
+                  }
+                  node.dispatchEvent(new Event('input', { bubbles: true }));
+                  node.dispatchEvent(new Event('change', { bubbles: true }));
+                }, injectValue);
+                log('  ⚡ Force-injected: ' + injectValue + ' for ' + labelText.slice(0, 30));
+              } catch(injectErr) {
+                log('  ⚠ Dropdown skip: ' + labelText.slice(0, 30));
+              }
             }
 
           } else if (tag === 'textarea' || (tag === 'input' && !['file','hidden','radio','checkbox'].includes(inputType))) {

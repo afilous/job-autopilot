@@ -288,12 +288,12 @@ async function pollForSecurityCode() {
     const startTime = Date.now();
     const searchAfter = Math.floor((startTime - 120000) / 1000); // last 2 min
 
-    while (Date.now() - startTime < 45000) {
+    while (Date.now() - startTime < 60000) {
       try {
         const res = await gmail.users.messages.list({
           userId: 'me',
-          q: 'subject:"security code" OR subject:"verification code" OR subject:"confirm your application" newer_than:2m',
-          maxResults: 3,
+          q: 'from:no-reply@us.greenhouse-mail.io newer_than:10m',
+          maxResults: 5,
         });
 
         if (res.data.messages && res.data.messages.length > 0) {
@@ -305,13 +305,11 @@ async function pollForSecurityCode() {
             const bodyText = bodyData ? Buffer.from(bodyData, 'base64').toString() : '';
             const fullText = snippet + ' ' + bodyText;
             
-            // Match 6-10 character alphanumeric codes
-            const codeMatch = fullText.match(/([a-zA-Z0-9]{6,10})/g);
+            // Greenhouse sends exactly 8 alphanumeric chars e.g. "tjka9Bi1"
+            const codeMatch = fullText.match(/([a-zA-Z0-9]{8})/g);
             if (codeMatch) {
-              // Filter out common non-code words
-              const code = codeMatch.find(c => 
-                !['application', 'submitted', 'position', 'greenhouse'].includes(c.toLowerCase())
-              );
+              const commonWords = ['security','passcode','confirm','complete','required','provided','yourself','november','december','january','february','application','submitted','greenhouse'];
+              const code = codeMatch.find(c => !commonWords.includes(c.toLowerCase()));
               if (code) {
                 log('  ✅ Found security code in Gmail: ' + code);
                 return code;
@@ -321,7 +319,7 @@ async function pollForSecurityCode() {
         }
       } catch(e) {}
       
-      await new Promise(r => setTimeout(r, 4000));
+      await new Promise(r => setTimeout(r, 3000));
     }
   } catch(e) {
     log('  ⚠ Gmail polling error: ' + e.message);
@@ -371,7 +369,17 @@ function getDropdownAnswer(labelText) {
     return 'Decline';
   }
 
-  // Priority 8: Referral source
+  // Priority 8: Education dropdowns
+  if (c.includes('school') || c.includes('university') || c.includes('college') || 
+      c.includes('institution')) return 'Georgetown University';
+  if (c.includes('degree') || c.includes('level of education')) return "Master's";
+  if (c.includes('discipline') || c.includes('field of study') || c.includes('major')) return 'European Studies';
+
+  // Priority 9: AI policy
+  if (c.includes('ai policy') || c.includes('artificial intelligence policy') ||
+      c.includes('use of ai') || c.includes('ai tool') || c.includes('used ai')) return 'No';
+
+  // Priority 10: Referral source
   if (c.includes('hear about') || c.includes('how did you') ||
       c.includes('source') || c.includes('referred')) return 'LinkedIn';
 
@@ -685,10 +693,11 @@ linkedin.com/in/aaron-filous`;
                     return el.parentElement;
                   });
 
-                  // Find the visible dropdown trigger — Greenhouse uses css- prefixed classes
+                  // Find the visible dropdown trigger — react-select, select2, or combobox
                   const trigger = await fieldContainer.$(
                     '[class*="css-"][class*="container"], [class*="css-"][class*="control"], ' +
-                    '[role="combobox"], div[class*="Select"], div[class*="select__control"]'
+                    '[role="combobox"], div[class*="Select"], div[class*="select__control"], ' +
+                    '.select2-choice, .select2-container, .select2-selection'
                   ).catch(() => null);
                   
                   if (trigger) {
@@ -762,31 +771,71 @@ linkedin.com/in/aaron-filous`;
                 }
               }
             } else {
-              // Regular visible text input
+              // Regular visible text input — comprehensive answer map
               let answer = null;
-              if (/linkedin/i.test(labelText)) answer = PROFILE.linkedin;
-              else if (/salary|compensation|pay/i.test(labelText)) answer = '145000';
-              else if (/website|portfolio/i.test(labelText)) answer = PROFILE.linkedin;
-              else if (/zip|postal/i.test(labelText)) answer = '94401';
-              else if (/preferred.*name|name.*prefer|preferred first/i.test(labelText)) answer = PROFILE.first_name;
-              else if (/name.*pronunc|pronunc/i.test(labelText)) answer = 'Aaron (air-on)';
-              else if (/why.*work|why.*join|why.*interest|what makes you|what excites/i.test(labelText)) answer = 'I am excited to apply my 10+ years of strategy and operations experience. At Enova International I led a $200M portfolio consolidation and drove 200% increase in SDR call connection rates. I look forward to bringing this expertise to your team.';
-              else if (/experience|background|align|describe/i.test(labelText)) answer = 'My background spans strategy, operations, and cross-functional leadership at Enova International, Product School, and App Academy, plus founding Promotable to $40k/month. I consistently translate complex problems into scalable operational systems.';
-              else if (/company|employer|recent/i.test(labelText)) answer = 'Enova International';
-              else if (/pronouns/i.test(labelText)) answer = 'He/Him';
-              else if (/first.*gen|generation/i.test(labelText)) answer = 'Yes';
-              else if (/github/i.test(labelText)) answer = '';
-              else if (/twitter|x\.com/i.test(labelText)) answer = '';
-              else if (/familiar.*with|how familiar/i.test(labelText)) answer = 'Somewhat familiar';
-              else if (/acknowledge|confirm|agree/i.test(labelText)) answer = 'Yes';
+              const lt = labelText.toLowerCase();
+
+              // Personal info
+              if (/linkedin/i.test(lt)) answer = PROFILE.linkedin;
+              else if (/website|portfolio|personal site/i.test(lt)) answer = PROFILE.linkedin;
+              else if (/github/i.test(lt)) answer = 'https://github.com/afilous';
+              else if (/twitter|x\.com/i.test(lt)) answer = '';
+              else if (/preferred.*name|name.*prefer|preferred first|first name/i.test(lt)) answer = PROFILE.first_name;
+              else if (/last name|surname/i.test(lt)) answer = PROFILE.last_name;
+              else if (/full.*name|legal.*name|name.*legal/i.test(lt)) answer = PROFILE.full_name;
+              else if (/pronunc/i.test(lt)) answer = 'Aaron (air-on)';
+              else if (/pronouns/i.test(lt)) answer = 'He/Him';
+              else if (/city/i.test(lt)) answer = 'San Mateo';
+              else if (/zip|postal/i.test(lt)) answer = '94401';
+              else if (/address/i.test(lt)) answer = 'San Mateo, CA 94401';
+
+              // Education
+              else if (/school|university|college|institution/i.test(lt)) answer = 'Georgetown University';
+              else if (/degree|level of education/i.test(lt)) answer = "Master's";
+              else if (/discipline|field of study|major|area of study/i.test(lt)) answer = 'European Studies';
+              else if (/gpa/i.test(lt)) answer = '3.7';
+              else if (/graduation|grad.*year|year.*grad/i.test(lt)) answer = '2015';
+
+              // Work
+              else if (/company|employer|recent.*company|current.*company/i.test(lt)) answer = 'Stealth Startup';
+              else if (/title|position|role.*current|current.*role/i.test(lt)) answer = 'Strategy & Operations Lead';
+              else if (/salary|compensation|pay expectation|desired.*pay/i.test(lt)) answer = '145000';
+              else if (/years.*experience|experience.*years/i.test(lt)) answer = '10';
+              else if (/start.*date|available|earliest.*start/i.test(lt)) answer = 'Immediately';
+
+              // Essay questions
+              else if (/why.*work|why.*join|why.*interest|what excites|what draws/i.test(lt)) answer = 'I am excited to apply my 10+ years of strategy and operations experience. At Enova International I led cross-functional initiatives including a $200M portfolio consolidation and drove a 200% increase in SDR productivity. I am drawn to this opportunity because it combines my passion for building scalable systems with a mission-driven team.';
+              else if (/why.*you|what makes you|what.*qualif|fit for this/i.test(lt)) answer = 'My background spans strategy, operations, and cross-functional leadership at Enova International, Product School, App Academy, and Promotable. I consistently translate complex problems into scalable operational systems and have a track record of delivering measurable results.';
+              else if (/experience|background|describe|tell us about/i.test(lt)) answer = 'My background spans 10+ years in strategy and operations roles. At Enova International I led a $200M portfolio consolidation, built SDR operations from the ground up, and drove cross-functional alignment across product, finance, and go-to-market teams.';
+              else if (/sql/i.test(lt)) answer = 'Yes, I have advanced SQL skills including complex joins, window functions, and query optimization.';
+              else if (/cover.*letter|additional.*info|anything.*else|other.*information/i.test(lt)) answer = 'Please see my attached cover letter and resume for additional details about my background and qualifications.';
+
+              // Source/referral
+              else if (/hear.*about|how.*find|source|referred/i.test(lt)) answer = 'LinkedIn';
+              else if (/familiar.*with|how familiar/i.test(lt)) answer = 'Somewhat familiar';
+
+              // Acknowledgments
+              else if (/acknowledge|confirm|agree|certify/i.test(lt)) answer = 'Yes';
+              else if (/first.*gen|generation/i.test(lt)) answer = 'Yes';
+
+              // Catch-all — use AI responses only if they don't reference wrong company
               else {
                 const responses = job.generated_responses || {};
+                const companyName = (job.company || '').toLowerCase();
                 for (const [q, a] of Object.entries(responses)) {
-                  if (labelText.includes(q.toLowerCase().slice(0, 20))) { answer = String(a); break; }
+                  if (lt.includes(q.toLowerCase().slice(0, 20))) {
+                    const aStr = String(a).toLowerCase();
+                    // Skip if answer mentions a different company by name
+                    const mentionsWrongCompany = aStr.includes('why ' + companyName) === false &&
+                      ['anthropic','faire','intercom','figma','affirm','gusto','chime','verkada',
+                       'mixpanel','amplitude','wonderschool','loop','waymo','ramp'].some(c => 
+                        c !== companyName && aStr.includes(c));
+                    if (!mentionsWrongCompany) { answer = String(a); break; }
+                  }
                 }
                 if (!answer) answer = 'Please see my attached resume for details.';
               }
-              await el.fill(answer.slice(0, 500));
+              await el.fill((answer || '').slice(0, 500));
               log('  ✓ Text input: ' + rawLabel.slice(0, 50));
             }
           }

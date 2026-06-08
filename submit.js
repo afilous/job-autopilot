@@ -1178,71 +1178,103 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
       return { success: false, manual: true, message: `Custom site: ${finalDomain}` };
     }
 
-    // React-aware field filling — type with delays + dispatch events
-    async function ashbyFill(selector, value) {
-      if (!value) return false;
-      try {
-        const el = await page.$(selector);
-        if (!el || !await el.isVisible().catch(() => false)) return false;
-        await el.scrollIntoViewIfNeeded();
-        await el.click({ clickCount: 3 }); // Select all existing content
-        await page.keyboard.press('Backspace');
-        await el.type(value, { delay: 40 + Math.random() * 20 });
-        await el.evaluate(e => {
-          e.dispatchEvent(new Event('input', { bubbles: true }));
-          e.dispatchEvent(new Event('change', { bubbles: true }));
-          e.dispatchEvent(new Event('blur', { bubbles: true }));
-        });
-        return true;
-      } catch(e) { return false; }
-    }
+    // Armored field interceptor — matches all visible inputs by context
+    log('  📝 Filling Ashby form fields...');
+    
+    const ESSAY_ANSWER = "I am most proud of building Promotable from scratch to $40k/month in revenue, selecting it as an education partner with 1871 Chicago's top tech incubator. I identified a gap in data skills training, built an automated omnichannel sales funnel, converted a B2C audience to enterprise clients including McDonald's and City Colleges of Chicago. This required building operations, sales, and marketing systems from zero while staying capital efficient.";
+    
+    const PROFESSIONAL_CONTEXT = 'Experienced strategy and operations leader with 10+ years driving cross-functional initiatives, GTM operations, and revenue efficiency.';
 
-    // Standard fields with React event dispatching
-    await ashbyFill('input[name*="firstName" i], input[placeholder*="First name" i]', PROFILE.first_name);
-    await ashbyFill('input[name*="lastName" i], input[placeholder*="Last name" i]', PROFILE.last_name);
-    await ashbyFill('input[type="email"]', PROFILE.email);
-    await ashbyFill('input[type="tel"]', PROFILE.phone_formatted);
-    await ashbyFill('input[name*="linkedin" i], input[placeholder*="linkedin" i]', PROFILE.linkedin);
-    await ashbyFill('input[name*="website" i], input[placeholder*="website" i], input[placeholder*="portfolio" i]', PROFILE.linkedin);
-    
-    // Full name field (some Ashby forms use single name field)
-    await ashbyFill('input[name*="name" i][name*="full" i], input[placeholder*="Full name" i], input[placeholder*="Name" i]', PROFILE.full_name);
-    
-    // Catch-all: fill any remaining empty required text inputs
     try {
-      const allInputs = await page.$$('input[type="text"], textarea');
-      for (const input of allInputs) {
-        const isRequired = await input.evaluate(el => el.required || el.getAttribute('aria-required') === 'true');
-        if (!isRequired) continue;
-        const currentVal = await input.evaluate(el => el.value || '').catch(() => '');
-        if (currentVal.trim()) continue;
-        
-        const placeholder = (await input.getAttribute('placeholder') || '').toLowerCase();
-        const ariaLabel = (await input.getAttribute('aria-label') || '').toLowerCase();
-        const context = placeholder + ' ' + ariaLabel;
-        
-        let fillVal = '';
-        if (/name/i.test(context)) fillVal = PROFILE.full_name;
-        else if (/linkedin/i.test(context)) fillVal = PROFILE.linkedin;
-        else if (/website|portfolio/i.test(context)) fillVal = PROFILE.linkedin;
-        else if (/hear|source|refer/i.test(context)) fillVal = 'LinkedIn';
-        else if (/phone|tel/i.test(context)) fillVal = PROFILE.phone_formatted;
-        else if (/email/i.test(context)) fillVal = PROFILE.email;
-        else fillVal = 'My experience includes 10+ years in strategy and operations roles. At Enova International I led a $200M portfolio consolidation and drove 200% increase in SDR productivity. I founded Promotable which grew to $40k/month revenue. I am proud of consistently translating complex operational challenges into scalable systems.';
-        
-        if (fillVal) {
-          await input.click();
-          await input.type(fillVal, { delay: 20 });
-          await input.evaluate(e => {
-            e.dispatchEvent(new Event('input', { bubbles: true }));
-            e.dispatchEvent(new Event('change', { bubbles: true }));
-            e.dispatchEvent(new Event('blur', { bubbles: true }));
-          });
-          log('  ✓ Filled empty required field: ' + context.slice(0, 30));
-        }
+      const formInputs = await page.$$('input, textarea, [contenteditable="true"]');
+      for (const input of formInputs) {
+        try {
+          const isVisible = await input.isVisible().catch(() => false);
+          if (!isVisible) continue;
+          
+          const inputType = await input.getAttribute('type').catch(() => '');
+          if (['file','hidden','submit','checkbox','radio'].includes(inputType)) continue;
+
+          // Anti-honeypot: check actual bounding box and computed styles
+          const isHoneypot = await input.evaluate(el => {
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            if (style.opacity === '0' || parseFloat(style.opacity) < 0.1) return true;
+            if (style.display === 'none' || style.visibility === 'hidden') return true;
+            if (rect.width === 0 || rect.height === 0) return true;
+            if (rect.width < 5 || rect.height < 5) return true;
+            if (style.position === 'absolute' || style.position === 'fixed') {
+              if (parseInt(style.left) < -100 || parseInt(style.top) < -100) return true;
+            }
+            // Check parent chain for hidden containers
+            let p = el.parentElement;
+            for (let i = 0; i < 4; i++) {
+              if (!p) break;
+              const ps = window.getComputedStyle(p);
+              if (ps.display === 'none' || ps.visibility === 'hidden' || ps.opacity === '0') return true;
+              p = p.parentElement;
+            }
+            return false;
+          }).catch(() => false);
+          
+          if (isHoneypot) {
+            log('  ⚠ Honeypot skipped');
+            continue;
+          }
+          
+          // Get context from element and its surroundings
+          const meta = await input.evaluate(el => {
+            const parent = el.closest('[class*="field"], [class*="form"], label, li, div') || el.parentElement;
+            const labelEl = document.querySelector(`label[for="${el.id}"]`);
+            return [
+              el.getAttribute('placeholder') || '',
+              el.getAttribute('aria-label') || '',
+              el.getAttribute('name') || '',
+              el.getAttribute('id') || '',
+              labelEl?.innerText || '',
+              parent?.innerText?.slice(0, 100) || ''
+            ].join(' ').toLowerCase();
+          }).catch(() => '');
+          
+          const currentVal = await input.evaluate(el => el.value || '').catch(() => '');
+          
+          // Skip if already filled with real content
+          const isPlaceholderVal = ['type here...', 'type here', ''].includes(currentVal.toLowerCase().trim());
+          if (currentVal.trim() && !isPlaceholderVal) continue;
+          
+          let fillVal = null;
+          
+          if (/name/.test(meta) && !meta.includes('company') && !meta.includes('employer') && !meta.includes('file') && !meta.includes('school')) {
+            if (meta.includes('first')) fillVal = PROFILE.first_name;
+            else if (meta.includes('last')) fillVal = PROFILE.last_name;
+            else fillVal = PROFILE.full_name;
+          } else if (/email/.test(meta)) fillVal = currentVal || PROFILE.email;
+          else if (/phone|tel/.test(meta)) fillVal = currentVal || PROFILE.phone_formatted;
+          else if (/linkedin/.test(meta)) fillVal = PROFILE.linkedin;
+          else if (/website|portfolio/.test(meta)) fillVal = PROFILE.linkedin;
+          else if (/hear|source|refer/.test(meta)) fillVal = 'LinkedIn';
+          else if (/company|employer|recent/.test(meta)) fillVal = 'Stealth Startup';
+          else if (/title|role|position/.test(meta)) fillVal = 'Strategy & Operations Lead';
+          else if (/proud|exceptional|built|example|accomplish/.test(meta)) fillVal = ESSAY_ANSWER;
+          else if (/why|excit|interest|fit|motivat/.test(meta)) fillVal = 'I am excited to apply my 10+ years of strategy and operations experience. At Enova International I led a $200M portfolio consolidation and drove 200% increase in SDR productivity. I look forward to bringing this expertise to your team.';
+          else if (/salary|compensation/.test(meta)) fillVal = '145000';
+          else if (inputType === 'textarea' && !currentVal.trim()) fillVal = PROFESSIONAL_CONTEXT;
+          
+          if (fillVal && fillVal !== currentVal) {
+            await input.scrollIntoViewIfNeeded();
+            await input.click({ clickCount: 3 });
+            await input.type(fillVal, { delay: 15 });
+            await input.evaluate(e => {
+              e.dispatchEvent(new Event('input', { bubbles: true }));
+              e.dispatchEvent(new Event('change', { bubbles: true }));
+              e.dispatchEvent(new Event('blur', { bubbles: true }));
+            });
+            log('  ✓ Filled: ' + meta.slice(0, 40).trim());
+          }
+        } catch(fe) {}
       }
     } catch(e) {
-      log('  ⚠ Required field sweep: ' + e.message.slice(0, 40));
+      log('  ⚠ Field interceptor: ' + e.message.slice(0, 50));
     }
 
     // Location field
@@ -1374,10 +1406,38 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
       log(`  ⚠ No submit button found. Buttons on page: ${btnTexts.filter(Boolean).join(' | ').slice(0, 100)}`);
     } else {
       await ashbyBtn.scrollIntoViewIfNeeded();
-      await ashbyBtn.hover();
-      await page.waitForTimeout(Math.floor(Math.random() * 300 + 100));
-      await ashbyBtn.click({ delay: Math.floor(Math.random() * 100 + 50) });
+      await ashbyBtn.focus();
+      await page.waitForTimeout(300);
+      
+      // Try standard click first
+      await ashbyBtn.click({ delay: 50 });
       log(`  🖱 Clicked submit button`);
+      await page.waitForTimeout(500);
+      
+      // If no network request fires, try React-aware pointer events
+      const quickCheck = await page.url();
+      if (quickCheck.includes('/application') && !quickCheck.includes('success')) {
+        log(`  🔄 Trying React pointer events...`);
+        await ashbyBtn.evaluate(btn => {
+          btn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, isTrusted: true }));
+          btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, isTrusted: true }));
+          btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, isTrusted: true }));
+          btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, isTrusted: true }));
+        });
+        await page.waitForTimeout(500);
+        
+        // Last resort: form.requestSubmit()
+        await page.evaluate(() => {
+          const form = document.querySelector('form');
+          if (form) {
+            if (typeof form.requestSubmit === 'function') {
+              form.requestSubmit();
+            } else {
+              form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+            }
+          }
+        }).catch(() => {});
+      }
     }
 
     // Check network response
@@ -1594,21 +1654,25 @@ async function uploadResumePdf(page, pdfUrl, selectors) {
       }
     }
 
-    // Fallback: use file chooser event with strict timeout
-    try {
-      log(`  📎 Trying file chooser approach...`);
-      const fileChooserPromise = page.waitForEvent('filechooser', { timeout: 3000 });
-      await page.click('input[type="file"], [data-automation-id*="resume"], label[for*="resume"]').catch(() => {});
-      const fileChooser = await fileChooserPromise.catch(() => null);
-      if (fileChooser) {
+    // Fallback: use file chooser event — fully wrapped to prevent crashes
+    await (async () => {
+      try {
+        log(`  📎 Trying file chooser approach...`);
+        const fileChooser = await Promise.race([
+          page.waitForEvent('filechooser'),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 3000))
+        ]).catch(() => null);
+        
+        if (!fileChooser) return;
+        
+        await page.click('input[type="file"], label[for*="resume"]').catch(() => {});
         await fileChooser.setFiles(tmpPath);
         await page.waitForTimeout(1500);
         log(`  ✅ Resume uploaded via file chooser`);
-        return true;
+      } catch(fcErr) {
+        log(`  ⚠ File chooser skipped: ${fcErr.message.slice(0, 40)}`);
       }
-    } catch(fcErr) {
-      log(`  ⚠ File chooser skipped: ${fcErr.message.slice(0, 40)}`);
-    }
+    })();
 
     log(`  ⚠ No file input found`);
     return false;

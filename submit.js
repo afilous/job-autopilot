@@ -1265,6 +1265,45 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
              resp.request().method() === 'POST';
     }, { timeout: 15000 }).catch(() => null);
 
+    // Pre-submit sweep — handle any unfilled required fields
+    try {
+      // A. Auto-select first option for any empty native dropdowns
+      const allSelects = await page.$$('select');
+      for (const sel of allSelects) {
+        const val = await sel.evaluate(el => el.value).catch(() => '');
+        if (!val) {
+          await sel.selectOption({ index: 1 }).catch(() => {});
+          log('  ✓ Auto-selected empty dropdown');
+        }
+      }
+    } catch(e) {}
+
+    try {
+      // B. Trigger change events on file upload container
+      const fileContainer = await page.$('[class*="fileUpload" i], [class*="upload" i], .dropzone, [class*="resume"]');
+      if (fileContainer) {
+        await fileContainer.evaluate(el => {
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          el.dispatchEvent(new Event('blur', { bubbles: true }));
+        });
+      }
+    } catch(e) {}
+
+    try {
+      // C. Select first option in any unchecked radio groups
+      const radioGroups = await page.$$('[role="radiogroup"], [class*="radioGroup" i]');
+      for (const group of radioGroups) {
+        const checked = await group.$('[aria-checked="true"], input:checked');
+        if (!checked) {
+          const firstOpt = await group.$('[role="radio"], input[type="radio"], label');
+          if (firstOpt) {
+            await firstOpt.click();
+            log('  ✓ Selected first radio option in empty group');
+          }
+        }
+      }
+    } catch(e) {}
+
     // Find Ashby submit button — try multiple selectors
     const ashbyBtnSelectors = [
       'button[type="submit"]',

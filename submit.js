@@ -796,6 +796,65 @@ linkedin.com/in/aaron-filous`;
       log('  ⚠ Form handler error: ' + e.message);
     }
 
+    // EEOC fields by label text — catches Amplitude-style fields without standard IDs
+    try {
+      const eeocLabels = await page.$$('label');
+      for (const lbl of eeocLabels) {
+        const lblText = (await lbl.textContent().catch(() => '')).toLowerCase().trim();
+        if (!lblText) continue;
+        const isEeoc = /gender|race|ethnic|sexual orient|disability|veteran|lgbtq|pronoun|transgender/.test(lblText);
+        if (!isEeoc) continue;
+        
+        const forAttr = await lbl.getAttribute('for');
+        if (!forAttr) continue;
+        
+        // Try to find and click the dropdown trigger near this label
+        const container = await lbl.evaluateHandle(el => {
+          let p = el.parentElement;
+          for (let i = 0; i < 5; i++) {
+            if (!p) break;
+            if (p.children.length > 1) return p;
+            p = p.parentElement;
+          }
+          return el.parentElement;
+        });
+        
+        const trigger = await container.$(
+          '[class*="css-"][class*="control"], [class*="css-"][class*="container"], [role="combobox"]'
+        ).catch(() => null);
+        
+        if (trigger && await trigger.isVisible().catch(() => false)) {
+          await trigger.click({ timeout: 2000, force: true });
+          await page.waitForTimeout(600);
+          
+          const options = await page.$$('[role="option"]');
+          let picked = false;
+          for (const opt of options) {
+            const t = (await opt.innerText().catch(() => '')).toLowerCase();
+            if (t.includes('decline') || t.includes('not wish') || t.includes('prefer not') ||
+                t.includes('choose not') || t.includes('do not have') || t.includes('not a protected')) {
+              await opt.click({ timeout: 1500 });
+              log('  ✓ EEOC label dropdown: ' + lblText.slice(0, 30));
+              picked = true;
+              break;
+            }
+          }
+          if (!picked && options.length > 0) {
+            // Pick last option (usually "Decline to self-identify")
+            const lastOpt = options[options.length - 1];
+            const lastText = (await lastOpt.innerText().catch(() => '')).trim();
+            if (lastText && !lastText.toLowerCase().includes('select')) {
+              await lastOpt.click({ timeout: 1500 });
+              log('  ✓ EEOC label dropdown (last): ' + lastText.slice(0, 30));
+            }
+          }
+          await page.waitForTimeout(300);
+        }
+      }
+    } catch(e) {
+      log('  ⚠ EEOC label handler: ' + e.message.slice(0, 50));
+    }
+
     // EEOC fields by known IDs (Verkada pattern)
     for (const eeocField of ['gender','hispanic_ethnicity','veteran_status','disability_status']) {
       try {
@@ -1274,12 +1333,27 @@ async function uploadResumePdf(page, pdfUrl, selectors) {
   try {
     // Download PDF first
     log(`  📥 Downloading resume...`);
-    const response = await fetch(pdfUrl);
-    if (!response.ok) { log(`  ⚠ Resume download failed: ${response.status}`); return false; }
-
-    const buffer = await response.arrayBuffer();
     const tmpPath = require('path').resolve('/tmp', 'aaron_resume.pdf');
-    fs.writeFileSync(tmpPath, Buffer.from(buffer));
+    
+    // Skip download if cached copy exists from this run
+    if (!fs.existsSync(tmpPath) || fs.statSync(tmpPath).size === 0) {
+      const dlController = new AbortController();
+      const dlTimeout = setTimeout(() => dlController.abort(), 15000);
+      try {
+        const response = await fetch(pdfUrl, { signal: dlController.signal });
+        clearTimeout(dlTimeout);
+        if (!response.ok) { log(`  ⚠ Resume download failed: ${response.status}`); return false; }
+        const buffer = await response.arrayBuffer();
+        fs.writeFileSync(tmpPath, Buffer.from(buffer));
+      } catch(dlErr) {
+        clearTimeout(dlTimeout);
+        log(`  ⚠ Resume download error: ${dlErr.message.slice(0,40)}`);
+        if (!fs.existsSync(tmpPath)) return false;
+        log(`  📎 Using cached resume`);
+      }
+    } else {
+      log(`  📎 Using cached resume`);
+    }
 
     // Verify file exists and has content
     if (!fs.existsSync(tmpPath) || fs.statSync(tmpPath).size === 0) {

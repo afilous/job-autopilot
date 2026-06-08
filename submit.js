@@ -100,6 +100,7 @@ async function main() {
   RESUME_VARIANTS.default = resumeData?.pdf_url || null;
   log(`📄 Resume: ${resumeData?.filename || 'default'}`);
 
+  // Reduce global timeouts to avoid long hangs
   const browser = await chromium.launch({
     headless: true,
     args: [
@@ -183,6 +184,8 @@ async function main() {
     });
 
     const page = await context.newPage();
+    page.setDefaultTimeout(15000);
+    page.setDefaultNavigationTimeout(30000);
 
     // Full Mac Chrome spoofing
     await page.addInitScript(() => {
@@ -290,9 +293,11 @@ async function pollForSecurityCode() {
 
     while (Date.now() - startTime < 60000) {
       try {
+        // Use explicit UTC timestamp to avoid timezone issues on GitHub Actions
+        const afterTimestamp = Math.floor((Date.now() - 600000) / 1000); // 10 min ago in UTC epoch
         const res = await gmail.users.messages.list({
           userId: 'me',
-          q: 'from:no-reply@us.greenhouse-mail.io newer_than:10m',
+          q: `from:no-reply@us.greenhouse-mail.io after:${afterTimestamp}`,
           maxResults: 5,
         });
 
@@ -1423,16 +1428,20 @@ async function uploadResumePdf(page, pdfUrl, selectors) {
       }
     }
 
-    // Fallback: use file chooser event
-    log(`  📎 Trying file chooser approach...`);
-    const fileChooserPromise = page.waitForEvent('filechooser', { timeout: 5000 });
-    await page.click('input[type="file"], [data-automation-id*="resume"], label[for*="resume"]').catch(() => {});
-    const fileChooser = await fileChooserPromise.catch(() => null);
-    if (fileChooser) {
-      await fileChooser.setFiles(tmpPath);
-      await page.waitForTimeout(1500);
-      log(`  ✅ Resume uploaded via file chooser`);
-      return true;
+    // Fallback: use file chooser event with strict timeout
+    try {
+      log(`  📎 Trying file chooser approach...`);
+      const fileChooserPromise = page.waitForEvent('filechooser', { timeout: 3000 });
+      await page.click('input[type="file"], [data-automation-id*="resume"], label[for*="resume"]').catch(() => {});
+      const fileChooser = await fileChooserPromise.catch(() => null);
+      if (fileChooser) {
+        await fileChooser.setFiles(tmpPath);
+        await page.waitForTimeout(1500);
+        log(`  ✅ Resume uploaded via file chooser`);
+        return true;
+      }
+    } catch(fcErr) {
+      log(`  ⚠ File chooser skipped: ${fcErr.message.slice(0, 40)}`);
     }
 
     log(`  ⚠ No file input found`);

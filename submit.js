@@ -1204,6 +1204,46 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
     await ashbyFill('input[type="tel"]', PROFILE.phone_formatted);
     await ashbyFill('input[name*="linkedin" i], input[placeholder*="linkedin" i]', PROFILE.linkedin);
     await ashbyFill('input[name*="website" i], input[placeholder*="website" i], input[placeholder*="portfolio" i]', PROFILE.linkedin);
+    
+    // Full name field (some Ashby forms use single name field)
+    await ashbyFill('input[name*="name" i][name*="full" i], input[placeholder*="Full name" i], input[placeholder*="Name" i]', PROFILE.full_name);
+    
+    // Catch-all: fill any remaining empty required text inputs
+    try {
+      const allInputs = await page.$$('input[type="text"], textarea');
+      for (const input of allInputs) {
+        const isRequired = await input.evaluate(el => el.required || el.getAttribute('aria-required') === 'true');
+        if (!isRequired) continue;
+        const currentVal = await input.evaluate(el => el.value || '').catch(() => '');
+        if (currentVal.trim()) continue;
+        
+        const placeholder = (await input.getAttribute('placeholder') || '').toLowerCase();
+        const ariaLabel = (await input.getAttribute('aria-label') || '').toLowerCase();
+        const context = placeholder + ' ' + ariaLabel;
+        
+        let fillVal = '';
+        if (/name/i.test(context)) fillVal = PROFILE.full_name;
+        else if (/linkedin/i.test(context)) fillVal = PROFILE.linkedin;
+        else if (/website|portfolio/i.test(context)) fillVal = PROFILE.linkedin;
+        else if (/hear|source|refer/i.test(context)) fillVal = 'LinkedIn';
+        else if (/phone|tel/i.test(context)) fillVal = PROFILE.phone_formatted;
+        else if (/email/i.test(context)) fillVal = PROFILE.email;
+        else fillVal = 'My experience includes 10+ years in strategy and operations roles. At Enova International I led a $200M portfolio consolidation and drove 200% increase in SDR productivity. I founded Promotable which grew to $40k/month revenue. I am proud of consistently translating complex operational challenges into scalable systems.';
+        
+        if (fillVal) {
+          await input.click();
+          await input.type(fillVal, { delay: 20 });
+          await input.evaluate(e => {
+            e.dispatchEvent(new Event('input', { bubbles: true }));
+            e.dispatchEvent(new Event('change', { bubbles: true }));
+            e.dispatchEvent(new Event('blur', { bubbles: true }));
+          });
+          log('  ✓ Filled empty required field: ' + context.slice(0, 30));
+        }
+      }
+    } catch(e) {
+      log('  ⚠ Required field sweep: ' + e.message.slice(0, 40));
+    }
 
     // Location field
     try {
@@ -1355,14 +1395,22 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
     log(`  📍 ${ashbyUrl}`);
 
     // STRICT confirmation — must navigate to /application/success or /thanks
-    if (ashbyResult || ashbyUrl.includes('/application/success') || ashbyUrl.includes('/thanks')) {
+    if (ashbyResult || ashbyUrl.includes('/application/success') || ashbyUrl.includes('/thanks') || ashbyUrl.includes('/confirmation')) {
       return { success: true, message: `Submitted via Ashby ✓` };
+    }
+    
+    // Log network response if we got one
+    if (networkResp) {
+      log(`  📡 Network POST: ${networkResp.status()} from ${networkResp.url().slice(0, 80)}`);
+    } else {
+      log(`  📡 No POST network request detected — form may not have submitted`);
     }
 
     // Check body text ONLY for very specific confirmation phrases — not generic words like "submit" or "success"
-    const ashbyText = await page.textContent('body').catch(() => '');
-    if (ashbyText.match(/your application was successfully submitted|application received|thank you for applying/i)) {
-      return { success: true, message: 'Submitted via Ashby ✓ (DOM)' };
+    // Check for success container element (more reliable than text matching)
+    const successEl = await page.$('[class*="successPage" i], [class*="success-page" i], [class*="confirmation" i], h1:has-text("Thank You"), h1:has-text("Application Submitted")').catch(() => null);
+    if (successEl) {
+      return { success: true, message: 'Submitted via Ashby ✓ (success element)' };
     }
 
     // Still on /application — submission did not complete

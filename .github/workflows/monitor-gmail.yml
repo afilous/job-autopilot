@@ -1,29 +1,237 @@
-name: Job Autopilot — Gmail Monitor
+/**
+ * Job Autopilot — Gmail Inbox Monitor
+ * Runs every 4 hours via GitHub Actions
+ * Classifies application emails and updates Supabase status
+ */
 
-on:
-  schedule:
-    - cron: '0 */4 * * *'  # Every 4 hours
-  workflow_dispatch:
+const { createClient } = require('@supabase/supabase-js');
 
-jobs:
-  monitor:
-    runs-on: ubuntu-latest
-    name: Scan inbox for application updates
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
+const GMAIL_CLIENT_ID = process.env.GMAIL_CLIENT_ID;
+const GMAIL_CLIENT_SECRET = process.env.GMAIL_CLIENT_SECRET;
+const GMAIL_REFRESH_TOKEN = process.env.GMAIL_REFRESH_TOKEN;
 
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '24'
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-      - name: Install dependencies
-        run: npm install
+// Email classification patterns
+const REJECTION_PATTERNS = [
+  /unfortunately.*unable to move forward/i,
+  /after careful consideration/i,
+  /we.*decided.*not.*proceed/i,
+  /keep your resume on file/i,
+  /not.*right fit at this time/i,
+  /decided to pursue other candidates/i,
+  /we won't be moving forward/i,
+  /we have decided to move forward with other/i,
+];
 
-      - name: Run Gmail monitor
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-          GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
-          GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
-          GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
-        run: node monitor-gmail.js
+const INTERVIEW_PATTERNS = [
+  /schedule.*interview/i,
+  /set up.*call/i,
+  /would love to chat/i,
+  /invite you to interview/i,
+  /next step/i,
+  /recruiter screen/i,
+  /phone screen/i,
+  /video interview/i,
+];
+
+const INTERVIEW_LINK_PATTERNS = [
+  /calendly\.com/i,
+  /chilipiper\.com/i,
+  /greenhouse\.io\/interviews/i,
+  /lever\.co\/interviews/i,
+  /zoom\.us/i,
+];
+
+const CONFIRMATION_PATTERNS = [
+  /thank you for applying/i,
+  /application received/i,
+  /we received your application/i,
+  /application has been submitted/i,
+];
+
+function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
+
+async function getGmailToken() {
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      client_id: GMAIL_CLIENT_ID,
+      client_secret: GMAIL_CLIENT_SECRET,
+      refresh_token: GMAIL_REFRESH_TOKEN,
+      grant_type: 'refresh_token',
+    }),
+  });
+  const data = await res.json();
+  return data.access_token;
+}
+
+async function listMessages(token, query) {
+  const res = await fetch(
+    `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(query)}&maxResults=50`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  const data = await res.json();
+  return data.messages || [];
+}
+
+async function getMessage(token, id) {
+  const res = await fetch(
+    `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  return res.json();
+}
+
+function extractBody(message) {
+  const payload = message.payload;
+  if (!payload) return '';
+
+  function decode(data) {
+    if (!data) return '';
+    return Buffer.from(data.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf-8');
+  }
+
+  if (payload.body?.data) return decode(payload.body.data);
+
+  for (const part of payload.parts || []) {
+    if (part.mimeType === 'text/plain' && part.body?.data) return decode(part.body.data);
+    if (part.mimeType === 'text/html' && part.body?.data) return decode(part.body.data);
+  }
+  return '';
+}
+
+function classifyEmail(subject, body) {
+  const text = `${subject} ${body}`;
+
+  // Check for interview scheduling links first (highest priority)
+  const hasInterviewLink = INTERVIEW_LINK_PATTERNS.some(p => p.test(text));
+  const isInterview = INTERVIEW_PATTERNS.some(p => p.test(text));
+
+  if (hasInterviewLink || isInterview) {
+    return { status: 'interviewing', priority: 'HIGH', reason: hasInterviewLink ? 'Calendar link detected' : 'Interview language detected' };
+  }
+
+  if (REJECTION_PATTERNS.some(p => p.test(text))) {
+    return { status: 'rejected', priority: 'LOW', reason: 'Rejection language detected' };
+  }
+
+  if (CONFIRMATION_PATTERNS.some(p => p.test(text))) {
+    return { status: 'confirmed', priority: 'LOW', reason: 'Application confirmation' };
+  }
+
+  return null;
+}
+
+function extractCompanyFromEmail(from, subject) {
+  // Try to match against known ATS domains
+  const atsPatterns = [
+    { pattern: /greenhouse-mail\.io/i, type: 'greenhouse' },
+    { pattern: /lever\.co/i, type: 'lever' },
+    { pattern: /ashbyhq\.com/i, type: 'ashby' },
+  ];
+
+  for (const { pattern } of atsPatterns) {
+    if (pattern.test(from)) return null; // Generic ATS email, need to parse subject
+  }
+
+  return null;
+}
+
+async function main() {
+  if (!GMAIL_CLIENT_ID || !GMAIL_REFRESH_TOKEN) {
+    log('⚠ Gmail credentials not configured — skipping inbox monitor');
+    log('  Add GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN to GitHub secrets');
+    return;
+  }
+
+  log('📧 Starting Gmail inbox monitor...');
+
+  const token = await getGmailToken();
+  if (!token) { log('❌ Failed to get Gmail token'); return; }
+
+  // Search for recent application-related emails
+  const since = new Date(Date.now() - 4 * 60 * 60 * 1000); // Last 4 hours
+  const dateStr = `${since.getFullYear()}/${since.getMonth() + 1}/${since.getDate()}`;
+  const query = `after:${dateStr} (subject:application OR subject:interview OR subject:opportunity OR from:greenhouse OR from:lever OR from:ashby)`;
+
+  const messages = await listMessages(token, query);
+  log(`📬 Found ${messages.length} emails to process`);
+
+  let interviews = 0, rejections = 0, confirmations = 0;
+
+  for (const { id } of messages) {
+    try {
+      const msg = await getMessage(token, id);
+      const headers = msg.payload?.headers || [];
+      const subject = headers.find(h => h.name === 'Subject')?.value || '';
+      const from = headers.find(h => h.name === 'From')?.value || '';
+      const body = extractBody(msg);
+
+      const classification = classifyEmail(subject, body);
+      if (!classification) continue;
+
+      log(`  📨 ${classification.priority} | ${classification.status} | ${subject.slice(0, 60)}`);
+      log(`     From: ${from}`);
+      log(`     Reason: ${classification.reason}`);
+
+      if (classification.status === 'interviewing') {
+        interviews++;
+        // Log high priority items prominently
+        log(`  🚨 HIGH PRIORITY INTERVIEW DETECTED — ${subject}`);
+      } else if (classification.status === 'rejected') {
+        rejections++;
+      } else if (classification.status === 'confirmed') {
+        confirmations++;
+      }
+
+      // Try to match to a Supabase application record
+      // Extract company name from subject/from for matching
+      const companyMatch = subject.match(/at\s+([A-Z][a-zA-Z\s]+?)[\s,!\.]/);
+      if (companyMatch) {
+        const companyName = companyMatch[1].trim();
+        const { data: apps } = await supabase
+          .from('applications')
+          .select('id, status')
+          .ilike('company', `%${companyName}%`)
+          .in('status', ['submitted', 'queued', 'processing'])
+          .limit(3);
+
+        if (apps && apps.length > 0) {
+          for (const app of apps) {
+            if (classification.status === 'interviewing' && app.status !== 'interviewing') {
+              await supabase.from('applications').update({
+                status: 'interviewing',
+                notes: `Interview detected: ${subject.slice(0, 100)}`,
+              }).eq('id', app.id);
+              log(`  ✅ Updated ${companyName} → interviewing`);
+            } else if (classification.status === 'rejected') {
+              await supabase.from('applications').update({
+                status: 'rejected',
+                notes: `Rejected: ${subject.slice(0, 100)}`,
+              }).eq('id', app.id);
+              log(`  ✅ Updated ${companyName} → rejected`);
+            }
+          }
+        }
+      }
+
+      await new Promise(r => setTimeout(r, 100)); // Rate limit Gmail API
+    } catch (e) {
+      log(`  ⚠ Error processing email: ${e.message}`);
+    }
+  }
+
+  log(`\n────────────────────────────────`);
+  log(`🚨 Interviews: ${interviews}`);
+  log(`❌ Rejections: ${rejections}`);
+  log(`✅ Confirmations: ${confirmations}`);
+}
+
+main().catch(err => {
+  log(`💥 Fatal: ${err.message}`);
+  process.exit(1);
+});

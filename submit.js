@@ -1228,12 +1228,40 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
              resp.request().method() === 'POST';
     }, { timeout: 15000 }).catch(() => null);
 
-    const ashbyBtn = page.locator('[type="submit"], button:has-text("Submit"), button:has-text("Apply")').first();
-    if (await ashbyBtn.count() > 0) {
+    // Find Ashby submit button — try multiple selectors
+    const ashbyBtnSelectors = [
+      'button[type="submit"]',
+      'button:has-text("Submit Application")',
+      'button:has-text("Submit application")',
+      'button:has-text("Submit")',
+      'button:has-text("Apply Now")',
+      'button:has-text("Apply now")',
+      'button:has-text("Apply")',
+      '[data-testid*="submit"]',
+      '[data-testid*="apply"]',
+    ];
+    
+    let ashbyBtn = null;
+    for (const sel of ashbyBtnSelectors) {
+      const btn = page.locator(sel).first();
+      if (await btn.count() > 0 && await btn.isVisible().catch(() => false)) {
+        ashbyBtn = btn;
+        log(`  🔘 Found submit button: ${sel}`);
+        break;
+      }
+    }
+    
+    if (!ashbyBtn) {
+      // Log all buttons on page for debugging
+      const allBtns = await page.$$('button');
+      const btnTexts = await Promise.all(allBtns.map(b => b.innerText().catch(() => '')));
+      log(`  ⚠ No submit button found. Buttons on page: ${btnTexts.filter(Boolean).join(' | ').slice(0, 100)}`);
+    } else {
       await ashbyBtn.scrollIntoViewIfNeeded();
       await ashbyBtn.hover();
       await page.waitForTimeout(Math.floor(Math.random() * 300 + 100));
       await ashbyBtn.click({ delay: Math.floor(Math.random() * 100 + 50) });
+      log(`  🖱 Clicked submit button`);
     }
 
     // Check network response
@@ -1264,11 +1292,25 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
     // Still on /application — submission did not complete
     log(`  ⚠ Still on /application page — form may not have submitted`);
     
-    // Check for validation errors
-    const ashbyErrors = await page.$$('[class*="error"], [class*="invalid"], [aria-invalid="true"]');
-    if (ashbyErrors.length > 0) {
-      const errTexts = await Promise.all(ashbyErrors.map(e => e.textContent().catch(() => '')));
-      log(`  📋 Ashby validation errors: ${errTexts.filter(Boolean).slice(0,3).join(' | ')}`);
+    // Check for validation errors using Ashby-specific selectors
+    const ashbyErrorSelectors = [
+      'div[class*="_error"]', 'div[class*="_errorMessage"]',
+      '[aria-invalid="true"]', 'span[class*="error"]',
+      '[class*="error"]', '[class*="invalid"]',
+      'p[class*="error"]', '[data-has-errors]'
+    ];
+    let allErrors = [];
+    for (const sel of ashbyErrorSelectors) {
+      const els = await page.$$(sel);
+      for (const el of els) {
+        const t = (await el.textContent().catch(() => '')).trim();
+        if (t && t.length > 2 && !allErrors.includes(t)) allErrors.push(t);
+      }
+    }
+    if (allErrors.length > 0) {
+      log(`  📋 Ashby validation errors: ${allErrors.slice(0, 5).join(' | ')}`);
+    } else {
+      log(`  📋 Ashby validation errors: (none detected)`);
     }
 
     await page.screenshot({ path: '/tmp/ashby-debug.png', fullPage: true }).catch(() => {});

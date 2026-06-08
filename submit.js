@@ -1178,19 +1178,56 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
       return { success: false, manual: true, message: `Custom site: ${finalDomain}` };
     }
 
-    // Standard fields
-    await humanType(page, 'input[name*="firstName" i]', PROFILE.first_name) ||
-    await humanType(page, 'input[placeholder*="First name" i]', PROFILE.first_name);
-
-    await humanType(page, 'input[name*="lastName" i]', PROFILE.last_name) ||
-    await humanType(page, 'input[placeholder*="Last name" i]', PROFILE.last_name);
-
-    await humanType(page, 'input[type="email"]', PROFILE.email);
-    await humanType(page, 'input[type="tel"]', PROFILE.phone_formatted);
-
-    for (const sel of ['input[name*="linkedin" i]', 'input[placeholder*="linkedin" i]']) {
-      if (await humanType(page, sel, PROFILE.linkedin)) break;
+    // React-aware field filling — type with delays + dispatch events
+    async function ashbyFill(selector, value) {
+      if (!value) return false;
+      try {
+        const el = await page.$(selector);
+        if (!el || !await el.isVisible().catch(() => false)) return false;
+        await el.scrollIntoViewIfNeeded();
+        await el.click({ clickCount: 3 }); // Select all existing content
+        await page.keyboard.press('Backspace');
+        await el.type(value, { delay: 40 + Math.random() * 20 });
+        await el.evaluate(e => {
+          e.dispatchEvent(new Event('input', { bubbles: true }));
+          e.dispatchEvent(new Event('change', { bubbles: true }));
+          e.dispatchEvent(new Event('blur', { bubbles: true }));
+        });
+        return true;
+      } catch(e) { return false; }
     }
+
+    // Standard fields with React event dispatching
+    await ashbyFill('input[name*="firstName" i], input[placeholder*="First name" i]', PROFILE.first_name);
+    await ashbyFill('input[name*="lastName" i], input[placeholder*="Last name" i]', PROFILE.last_name);
+    await ashbyFill('input[type="email"]', PROFILE.email);
+    await ashbyFill('input[type="tel"]', PROFILE.phone_formatted);
+    await ashbyFill('input[name*="linkedin" i], input[placeholder*="linkedin" i]', PROFILE.linkedin);
+    await ashbyFill('input[name*="website" i], input[placeholder*="website" i], input[placeholder*="portfolio" i]', PROFILE.linkedin);
+
+    // Location field
+    try {
+      const locInput = await page.$('input[placeholder*="Location" i], input[aria-label*="location" i], input[placeholder*="City" i]');
+      if (locInput && await locInput.isVisible().catch(() => false)) {
+        await locInput.click();
+        await locInput.type('San Mateo, CA', { delay: 50 });
+        await page.waitForTimeout(1000);
+        const opt = await page.$('[role="option"], [class*="option"]');
+        if (opt) await opt.click();
+        else { await page.keyboard.press('ArrowDown'); await page.keyboard.press('Enter'); }
+        log('  ✓ Ashby location filled');
+      }
+    } catch(e) {}
+
+    // Check and click any consent/privacy checkboxes
+    try {
+      const checkboxes = await page.$$('input[type="checkbox"]');
+      for (const cb of checkboxes) {
+        if (!await cb.isChecked().catch(() => true)) {
+          await cb.evaluate(el => el.click());
+        }
+      }
+    } catch(e) {}
 
     if (resumePdfUrl) {
       await uploadResumePdf(page, resumePdfUrl, ['input[type="file"]']);

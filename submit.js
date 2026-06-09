@@ -116,6 +116,19 @@ async function main() {
 
   for (let i = 0; i < jobs.length; i++) {
     const job = jobs[i];
+    // Job title safety filter — archive and skip irrelevant roles
+    const titleLower = (job.job_title || '').toLowerCase();
+    const titleBlacklist = ['security operations', 'incident response', ' soc ', 'v-bat', 
+      'air vehicle', 'drone operator', 'software engineer', 'backend engineer', 'frontend engineer',
+      'devops', 'data scientist', 'machine learning engineer', 'legal counsel', 'attorney', 
+      'accountant', 'debt collection', 'collections specialist', 'field technician', 
+      'hardware engineer', 'network engineer', 'technical program manager'];
+    if (titleBlacklist.some(t => titleLower.includes(t))) {
+      await supabase.from('applications').update({ status: 'archived' }).eq('id', job.id).catch(() => {});
+      log(`  ⏭ Archived irrelevant role: ${job.job_title}`);
+      continue;
+    }
+
     log(`\n[${i + 1}/${jobs.length}] ${job.job_title} at ${job.company} (${job.ats_type})`);
     log(`  Score: ${job.match_score}% | Variant: ${job.resume_variant || 'default'}`);
 
@@ -383,6 +396,13 @@ function getDropdownAnswer(labelText) {
   // Priority 9: AI policy
   if (c.includes('ai policy') || c.includes('artificial intelligence policy') ||
       c.includes('use of ai') || c.includes('ai tool') || c.includes('used ai')) return 'No';
+
+  // Priority 9b: M&A / deal experience
+  if (c.includes('m&a') || c.includes('merger') || c.includes('acquisition') ||
+      c.includes('deal process') || c.includes('negotiating')) return 'No';
+  
+  // Priority 9c: First generation professional
+  if (c.includes('first-generation') || c.includes('first generation professional')) return 'Decline';
 
   // Priority 10: Referral source
   if (c.includes('hear about') || c.includes('how did you') ||
@@ -1102,13 +1122,16 @@ async function submitLever(page, job, resumeText, resumePdfUrl, focus) {
     }
 
     // Clear and fill after parse — guarantees our values win
-    // Target precise selectors to avoid triggering LinkedIn OAuth iframe
-    await clearAndType(page, 'input[name="name"]', PROFILE.full_name);
-    await clearAndType(page, 'input[name="email"]', PROFILE.email);
-    await clearAndType(page, 'input[name="phone"]', PROFILE.phone_formatted);
+    const nameFilled = await clearAndType(page, 'input[name="name"]', PROFILE.full_name);
+    const emailFilled = await clearAndType(page, 'input[name="email"]', PROFILE.email);
+    const phoneFilled = await clearAndType(page, 'input[name="phone"]', PROFILE.phone_formatted);
+    log(`  📝 Lever fields: name=${nameFilled} email=${emailFilled} phone=${phoneFilled}`);
 
     // Lever LinkedIn exact field name
     await clearAndType(page, 'input[name="urls[LinkedIn]"]', PROFILE.linkedin);
+    
+    // Also try filling org/company field if present
+    await clearAndType(page, 'input[name="org"]', 'Stealth Startup').catch(() => {});
 
     // Custom questions
     const answers = job.generated_responses || {};
@@ -1153,7 +1176,8 @@ async function submitLever(page, job, resumeText, resumePdfUrl, focus) {
     if (leverResult || leverUrl.includes('/thanks')) {
       return { success: true, message: `Submitted via Lever ✓` };
     }
-    if (leverText.match(/thank you|application received|submitted/i)) {
+    // Strict DOM check - must be very specific confirmation text, not just "submit" button
+    if (leverText.match(/application submitted!|your application has been received|thank you for applying/i)) {
       return { success: true, message: 'Submitted via Lever ✓ (DOM)' };
     }
 
@@ -1194,6 +1218,15 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
           
           const inputType = await input.getAttribute('type').catch(() => '');
           if (['file','hidden','submit','checkbox','radio'].includes(inputType)) continue;
+
+          // Skip UUID-style IDs — these are always honeypots
+          const inputId = await input.getAttribute('id').catch(() => '') || '';
+          const inputName = await input.getAttribute('name').catch(() => '') || '';
+          const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}/i;
+          if (uuidPattern.test(inputId) || uuidPattern.test(inputName)) {
+            log('  ⚠ UUID honeypot skipped: ' + inputId.slice(0, 20));
+            continue;
+          }
 
           // Anti-honeypot: check actual bounding box and computed styles
           const isHoneypot = await input.evaluate(el => {
@@ -1526,9 +1559,15 @@ async function clearAndType(page, selector, value) {
   if (!value) return false;
   try {
     const el = await page.$(selector);
-    if (!el) return false;
-    await el.fill('');
-    await el.fill(value);
+    if (!el || !await el.isVisible().catch(() => false)) return false;
+    await el.scrollIntoViewIfNeeded();
+    await el.click({ clickCount: 3 });
+    await el.type(value, { delay: 30 });
+    await el.evaluate(e => {
+      e.dispatchEvent(new Event('input', { bubbles: true }));
+      e.dispatchEvent(new Event('change', { bubbles: true }));
+      e.dispatchEvent(new Event('blur', { bubbles: true }));
+    });
     return true;
   } catch (e) { return false; }
 }

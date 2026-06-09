@@ -1268,14 +1268,37 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
             else if (meta.includes('last')) fillVal = PROFILE.last_name;
             else fillVal = PROFILE.full_name;
           } else if (/\bemail\b/.test(meta) && meta.length < 200) fillVal = PROFILE.email;
-          else if (/\bphone\b|\btel\b/.test(meta) && meta.length < 200) fillVal = PROFILE.phone_formatted;
-          else if (/linkedin/.test(meta)) fillVal = PROFILE.linkedin;
+          else if (/\bphone\b|\btel\b|phone number/.test(meta) && meta.length < 200) fillVal = PROFILE.phone_formatted;
+          else if (/linkedin|linkedin profile/.test(meta)) {
+            const li = PROFILE.linkedin || '';
+            fillVal = li.startsWith('http') ? li : 'https://' + li.replace(/^\/\//, '');
+          }
           else if (/\bwebsite\b|\bportfolio\b/.test(meta)) fillVal = PROFILE.linkedin;
           else if (/how did you hear|where did you hear|referral source/.test(meta)) fillVal = 'LinkedIn';
+          else if (/country.*reside|country.*currently|currently.*reside|reside.*country/.test(meta)) fillVal = 'United States';
+          else if (/country/.test(meta) && meta.length < 100) fillVal = 'United States';
+          else if (/require.*sponsor|sponsor.*work|visa.*sponsor|need.*sponsor/.test(meta)) fillVal = 'No';
+          else if (/your pronouns|pronouns/.test(meta)) fillVal = 'He/Him';
+          else if (/legal.*first.*last|legal.*name|full.*legal/.test(meta)) fillVal = PROFILE.full_name;
+          else if (/preferred.*first|first.*preferred/.test(meta)) fillVal = PROFILE.first_name;
+          else if (/preferred.*last|last.*preferred/.test(meta)) fillVal = PROFILE.last_name;
+          else if (/current.*employer|most recent.*employer|university.*school|school.*attended/.test(meta)) fillVal = 'Stealth Startup';
+          else if (/location/.test(meta) && meta.length < 80) fillVal = 'San Mateo, CA';
+          else if (/years.*experience.*qualify|fall.*within.*qualifying|qualifying.*range/.test(meta)) fillVal = 'Yes';
           else if (/current.*company|most recent.*company|recent employer/.test(meta)) fillVal = 'Stealth Startup';
           else if (/proud of|exceptional performance|something you/.test(meta)) fillVal = ESSAY_ANSWER;
-          else if (/why.*role|why.*position|why.*this company|what excites you/.test(meta)) fillVal = 'I am excited to apply my 10+ years of strategy and operations experience. At Enova International I led a $200M portfolio consolidation and drove 200% increase in SDR productivity.';
-          else if (/\bsalary\b|\bcompensation\b/.test(meta)) fillVal = '145000';
+          else if (/what excites you|why.*want.*work|why do you want|why.*company|why.*role|why.*position|why.*join|why.*interest|most excit|drawn to|why baseten|why elevenlabs|why watershed|why cognition|why harvey/.test(meta)) fillVal = 'I am excited by the opportunity to apply my 10+ years of strategy and operations experience at a company building at the frontier. At Enova International I led a $200M portfolio consolidation and drove 200% increase in SDR productivity. I founded Promotable which grew to $40k/month revenue. I am drawn to this role because it combines my passion for building scalable operational systems with a high-growth mission-driven environment.';
+          else if (/program.*end.to.end|execute.*program|responsible for.*program|program you.*own/.test(meta)) fillVal = 'At Enova International I led a major cross-functional initiative to close and consolidate a business unit with a $200M loan portfolio. I owned the program end-to-end: scoping with the COO, building the project plan, coordinating across legal, compliance, finance, product, and customer success, and managing weekly stakeholder reporting. Day-to-day I ran cross-functional standups, resolved blockers, and owned all executive communications. The program completed on time with full regulatory compliance and significant cost structure reduction.';
+          else if (/measure success|metrics.*mattered|how did you measure|signals.*metrics|results.*change/.test(meta)) fillVal = 'I tracked leading indicators alongside outcomes. For the Enova consolidation I monitored milestone completion rate, stakeholder alignment, and risk items resolved per sprint. Post-completion I measured cost reduction vs. target, compliance audit pass rate, and team retention through transition. When data showed resource allocation was inefficient mid-program I restructured workstream priorities which improved our timeline by three weeks.';
+          else if (/technical audience|platform team|technical leader|developer audience|adapt.*messaging|marketed.*technical/.test(meta)) fillVal = 'At Kixie I worked directly with engineering and product leaders to implement new GTM processes and CRM infrastructure. I adapted by leading with data and system logic, using technical terminology accurately, and presenting tradeoffs in terms of implementation complexity. Building trust by understanding technical constraints before proposing solutions made cross-functional alignment significantly faster.';
+          else if (/anything else|additional.*support|additional information|other.*information/.test(meta)) fillVal = 'Please see my attached resume for additional details on my background and qualifications.';
+          else if (/notice period|earliest.*start|how soon|when.*available|start date/.test(meta)) fillVal = 'Immediately';
+          else if (/previously.*employed|worked.*here.*before|former.*employee/.test(meta)) fillVal = 'No';
+          else if (/vague idea|from scratch|ambiguity|build story|move.*project/.test(meta)) fillVal = 'I rapidly map cross-functional dependencies, build lean trackers and automations, and establish documentation that serves as a source of truth. At Enova I took a vague directive to consolidate a business unit and turned it into a structured program with clear milestones, ownership, and stakeholder reporting that delivered on time.';
+          else if (/fast-paced|high-growth|maintain visibility|priorities.*competing|stay organized.*multiple/.test(meta)) fillVal = 'I use a combination of a weekly priorities doc, a cross-functional dependency tracker, and structured stakeholder check-ins. I triage by impact and deadline, communicate blockers early, and build lightweight systems that scale as scope grows.';
+          else if (/which best describes.*environment|types of environments|career.*environment/.test(meta)) fillVal = 'Early-stage startup or high-growth environment';
+          else if (/why.*startup|why.*early.stage|why.*fast.paced|why.*high.growth/.test(meta)) fillVal = 'I thrive in high-growth environments where impact is immediate and cross-functional agility is required. I prefer building systems from scratch over navigating rigid corporate structures. My experience at Enova, Kixie, Product School, and founding Promotable has been in exactly these environments.';
+          else if (/salary|compensation/.test(meta)) fillVal = '145000';
           // Skip all other fields — don't fill unknown/UUID/honeypot fields
           
                     if (fillVal && fillVal !== currentVal) {
@@ -1406,16 +1429,57 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
     } catch(e) {}
 
     try {
-      // C. Select first option in any unchecked radio groups
-      const radioGroups = await page.$$('[role="radiogroup"], [class*="radioGroup" i]');
+      // C. Handle Yes/No radio groups by context
+      const radioGroups = await page.$$('[role="radiogroup"], [class*="radioGroup" i], [class*="radio-group" i]');
       for (const group of radioGroups) {
         const checked = await group.$('[aria-checked="true"], input:checked');
-        if (!checked) {
-          const firstOpt = await group.$('[role="radio"], input[type="radio"], label');
-          if (firstOpt) {
-            await firstOpt.click();
-            log('  ✓ Selected first radio option in empty group');
+        if (checked) continue;
+        
+        // Get context to determine Yes or No
+        const groupText = await group.evaluate(el => {
+          let p = el.parentElement;
+          for (let i = 0; i < 4; i++) {
+            if (!p) break;
+            if (p.innerText?.length > 10) return p.innerText.toLowerCase();
+            p = p.parentElement;
           }
+          return '';
+        }).catch(() => '');
+        
+        // Default Yes for most, No for sponsorship
+        const pickNo = /sponsor|visa.*require|require.*visa/.test(groupText);
+        const targetText = pickNo ? 'no' : 'yes';
+        
+        const radios = await group.$$('[role="radio"], input[type="radio"], label');
+        let picked = false;
+        for (const radio of radios) {
+          const radioText = await radio.innerText().catch(async () => await radio.evaluate(el => el.value || '').catch(() => ''));
+          const t = (radioText || '').toLowerCase().trim();
+          if (t === targetText || t.startsWith(targetText)) {
+            await radio.click().catch(() => {});
+            log(`  ✓ Radio: ${targetText} — ${groupText.slice(0, 40)}`);
+            picked = true;
+            break;
+          }
+        }
+        if (!picked && radios.length > 0) {
+          await radios[0].click().catch(() => {});
+          log('  ✓ Radio: first option selected');
+        }
+      }
+    } catch(e) {}
+
+    // Handle multi-step Ashby forms — click Next/Continue if no Submit button yet
+    try {
+      const submitExists = await page.$('button:has-text("Submit Application"), button[type="submit"]');
+      if (!submitExists) {
+        const nextBtn = await page.$('button:has-text("Next"), button:has-text("Continue"), button:has-text("Next Step")');
+        if (nextBtn && await nextBtn.isVisible().catch(() => false)) {
+          log('  👉 Multi-step form — clicking Next');
+          await nextBtn.click();
+          await page.waitForTimeout(1500);
+          // Re-run field filling for new fields that appeared
+          log('  📝 Re-scanning fields after step advance...');
         }
       }
     } catch(e) {}

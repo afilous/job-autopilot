@@ -124,7 +124,7 @@ async function main() {
       'accountant', 'debt collection', 'collections specialist', 'field technician', 
       'hardware engineer', 'network engineer', 'technical program manager'];
     if (titleBlacklist.some(t => titleLower.includes(t))) {
-      await supabase.from('applications').update({ status: 'archived' }).eq('id', job.id).catch(() => {});
+      try { await supabase.from('applications').update({ status: 'archived' }).eq('id', job.id); } catch(e) {}
       log(`  ⏭ Archived irrelevant role: ${job.job_title}`);
       continue;
     }
@@ -1228,25 +1228,13 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
             continue;
           }
 
-          // Anti-honeypot: check actual bounding box and computed styles
+          // Anti-honeypot: quick dimension check only (no parent chain to avoid hangs)
           const isHoneypot = await input.evaluate(el => {
-            const style = window.getComputedStyle(el);
             const rect = el.getBoundingClientRect();
-            if (style.opacity === '0' || parseFloat(style.opacity) < 0.1) return true;
-            if (style.display === 'none' || style.visibility === 'hidden') return true;
             if (rect.width === 0 || rect.height === 0) return true;
             if (rect.width < 5 || rect.height < 5) return true;
-            if (style.position === 'absolute' || style.position === 'fixed') {
-              if (parseInt(style.left) < -100 || parseInt(style.top) < -100) return true;
-            }
-            // Check parent chain for hidden containers
-            let p = el.parentElement;
-            for (let i = 0; i < 4; i++) {
-              if (!p) break;
-              const ps = window.getComputedStyle(p);
-              if (ps.display === 'none' || ps.visibility === 'hidden' || ps.opacity === '0') return true;
-              p = p.parentElement;
-            }
+            const style = window.getComputedStyle(el);
+            if (style.opacity === '0' || style.display === 'none' || style.visibility === 'hidden') return true;
             return false;
           }).catch(() => false);
           
@@ -1366,6 +1354,32 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
              (url.includes('/application') || url.includes('/apply') || url.includes('/submit')) &&
              resp.request().method() === 'POST';
     }, { timeout: 15000 }).catch(() => null);
+
+    // Handle "How did you hear about us" Ashby dropdown
+    try {
+      const allCombos = await page.$$('[role="combobox"]');
+      for (const cb of allCombos) {
+        if (!await cb.isVisible().catch(() => false)) continue;
+        const parentText = await cb.evaluate(el => {
+          let p = el.parentElement;
+          for (let i = 0; i < 5; i++) { if (!p) break; if (p.innerText?.length > 5) return p.innerText.toLowerCase(); p = p.parentElement; }
+          return '';
+        }).catch(() => '');
+        if (/how did you hear|where did you hear|referral|source/.test(parentText)) {
+          await cb.click().catch(() => {});
+          await new Promise(r => setTimeout(r, 500));
+          const opts = await page.$$('[role="option"]');
+          for (const opt of opts) {
+            const t = (await opt.innerText().catch(() => '')).toLowerCase();
+            if (t.includes('linkedin') || t.includes('other') || t.includes('job board') || t.includes('online')) {
+              await opt.click().catch(() => {});
+              log('  ✓ Hear about us: ' + t.slice(0, 25));
+              break;
+            }
+          }
+        }
+      }
+    } catch(e) {}
 
     // Pre-submit sweep — handle any unfilled required fields
     try {

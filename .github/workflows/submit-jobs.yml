@@ -1,31 +1,22 @@
 name: Job Autopilot — Submit Applications
 
 on:
-  schedule:
-    - cron: '0 7 * * *'  # 7am UTC = midnight PT
-  workflow_dispatch:       # allows manual trigger from GitHub UI
+  workflow_dispatch:
 
 jobs:
   submit:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
+    name: submit
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '24'
-
       - name: Install dependencies
         run: npm install
-
       - name: Install Playwright browsers
         run: npx playwright install chromium --with-deps
-
-      - name: Run job submissions
+      - name: Run node submit.js
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
@@ -34,16 +25,11 @@ jobs:
           GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
           GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
         run: node submit.js
-
-      - name: Upload run log and debug files
+      - name: Upload submission log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: submission-log-${{ github.run_id }}
           path: |
-            run-log.json
-            /tmp/greenhouse-debug.html
-            /tmp/greenhouse-debug.png
-            /tmp/lever-debug.png
-            /tmp/ashby-debug.png
-          retention-days: 30
+            /tmp/submission-log-*.json
+            /tmp/debug-*.html

@@ -1132,6 +1132,101 @@ async function submitLever(page, job, resumeText, resumePdfUrl, focus) {
     
     // Also try filling org/company field if present
     await clearAndType(page, 'input[name="org"]', 'Stealth Startup').catch(() => {});
+    
+    // Additional Lever fields
+    await clearAndType(page, 'input[name="location"]', 'San Mateo, CA').catch(() => {});
+    await clearAndType(page, 'input[name="urls[LinkedIn]"]', PROFILE.linkedin).catch(() => {});
+    
+    // Export control / citizenship
+    const exportField = await page.$('input[name*="export"], textarea[name*="export"], input[placeholder*="export" i], input[placeholder*="citizenship" i]').catch(() => null);
+    if (exportField) {
+      await clearAndType(page, 'input[name*="export"], textarea[name*="export"]', 'United States citizen').catch(() => {});
+    }
+    
+    // Handle all Lever custom question blocks
+    const questionBlocks = await page.$$('.application-question, [data-qa="additional-cards"] .card, .cards-app-item');
+    for (const block of questionBlocks) {
+      const blockText = (await block.textContent().catch(() => '')).toLowerCase();
+      
+      // Sponsorship dropdown
+      if (/sponsorship|visa sponsor|require.*sponsor/.test(blockText)) {
+        const sel = await block.$('select, [role="combobox"]');
+        if (sel) {
+          await sel.selectOption({ label: 'No' }).catch(async () => {
+            await sel.click().catch(() => {});
+            await new Promise(r => setTimeout(r, 400));
+            const noOpt = await page.$('[role="option"]:has-text("No")');
+            if (noOpt) await noOpt.click().catch(() => {});
+          });
+          log('  ✓ Lever sponsorship: No');
+        }
+        // Also try radio
+        const noRadio = await block.$('input[value="No"], label:has-text("No")');
+        if (noRadio) await noRadio.click().catch(() => {});
+      }
+      
+      // How did you hear
+      if (/how did you hear|hear about us/.test(blockText)) {
+        const sel = await block.$('select, [role="combobox"]');
+        if (sel) {
+          await sel.selectOption({ label: 'LinkedIn' }).catch(async () => {
+            await sel.click().catch(() => {});
+            await new Promise(r => setTimeout(r, 400));
+            const opt = await page.$('[role="option"]:has-text("LinkedIn")');
+            if (opt) await opt.click().catch(() => {});
+            else {
+              const otherOpt = await page.$('[role="option"]:has-text("Other")');
+              if (otherOpt) await otherOpt.click().catch(() => {});
+            }
+          });
+          log('  ✓ Lever hear about us: LinkedIn');
+        }
+      }
+      
+      // Work authorization
+      if (/authorized.*work|work.*authorized|eligible.*work/.test(blockText)) {
+        const yesOpt = await block.$('input[value="Yes"], label:has-text("Yes")');
+        if (yesOpt) await yesOpt.click().catch(() => {});
+      }
+      
+      // Pronouns
+      if (/pronoun/.test(blockText)) {
+        const heOpt = await block.$('label:has-text("He/him"), input[value*="he"]');
+        if (heOpt) await heOpt.click().catch(() => {});
+      }
+      
+      // Export control text field
+      if (/export.*control|export.*licens|citizen.*country|countries.*citizen/.test(blockText)) {
+        const textInput = await block.$('input[type="text"], textarea');
+        if (textInput) {
+          await clearAndType(page, null, 'United States').catch(() => {});
+          await textInput.click().catch(() => {});
+          await textInput.type('United States citizen', { delay: 20 }).catch(() => {});
+          log('  ✓ Lever export control filled');
+        }
+      }
+      
+      // Preferred name
+      if (/preferred.*name|preferred first/.test(blockText)) {
+        const textInput = await block.$('input[type="text"]');
+        if (textInput && await textInput.isVisible().catch(() => false)) {
+          const val = await textInput.inputValue().catch(() => '');
+          if (!val) await textInput.type(PROFILE.first_name, { delay: 20 }).catch(() => {});
+        }
+      }
+    }
+    
+    // EEOC dropdowns
+    for (const [label, value] of [
+      ['Gender', 'Decline to self-identify'],
+      ['Race', 'Decline to self-identify'],
+      ['Veteran status', 'Decline to self-identify'],
+    ]) {
+      try {
+        const sel = await page.$(`select:near(:text("${label}"))`).catch(() => null);
+        if (sel) await sel.selectOption({ label: value }).catch(() => {});
+      } catch(e) {}
+    }
 
     // Custom questions
     const answers = job.generated_responses || {};

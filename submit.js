@@ -1251,6 +1251,13 @@ async function submitLever(page, job, resumeText, resumePdfUrl, focus) {
       }),
     ]).catch(() => null);
 
+    // Check for CAPTCHA before submitting
+    const captcha = await page.$('#h-captcha, .h-captcha, iframe[src*="hcaptcha"], iframe[src*="recaptcha"]').catch(() => null);
+    if (captcha) {
+      log('  ⚠ CAPTCHA detected — cannot submit automatically');
+      return { success: false, manual: true, message: 'CAPTCHA wall detected' };
+    }
+
     // Submit with humanized click
     let leverSubmitted = false;
     for (const sel of ['button[data-qa="btn-submit"]', '.lever-button-black[type="submit"]', 'button[type="submit"]', 'input[type="submit"]', 'button:has-text("Submit Application")', 'button:has-text("Apply")']) {
@@ -1326,6 +1333,22 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
           const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}/i;
           if (uuidPattern.test(inputId) || uuidPattern.test(inputName)) {
             log('  ⚠ UUID honeypot skipped: ' + inputId.slice(0, 20));
+            continue;
+          }
+          
+          // Directly fill known Ashby system fields by ID
+          if (inputId === '_systemfield_phone' || inputName === '_systemfield_phone') {
+            await input.click({ clickCount: 3 });
+            await input.type(PROFILE.phone_formatted, { delay: 20 });
+            await input.evaluate(e => { e.dispatchEvent(new Event('input', { bubbles: true })); e.dispatchEvent(new Event('change', { bubbles: true })); });
+            log('  ✓ Filled system phone field');
+            continue;
+          }
+          if (inputId === '_systemfield_linkedin' || inputName === '_systemfield_linkedin') {
+            await input.click({ clickCount: 3 });
+            await input.type(PROFILE.linkedin, { delay: 20 });
+            await input.evaluate(e => { e.dispatchEvent(new Event('input', { bubbles: true })); e.dispatchEvent(new Event('change', { bubbles: true })); });
+            log('  ✓ Filled system LinkedIn field');
             continue;
           }
 
@@ -1510,6 +1533,15 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
             }
           }
         }
+      }
+    } catch(e) {}
+
+    // Check for CAPTCHA before submitting
+    try {
+      const ashbyCaptcha = await page.$('#h-captcha, .h-captcha, iframe[src*="hcaptcha"]').catch(() => null);
+      if (ashbyCaptcha) {
+        log('  ⚠ CAPTCHA detected — cannot submit automatically');
+        return { success: false, manual: true, message: 'CAPTCHA wall detected' };
       }
     } catch(e) {}
 

@@ -1400,16 +1400,26 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
           
           // Directly fill known Ashby system fields by ID
           if (inputId === '_systemfield_phone' || inputName === '_systemfield_phone') {
+            await input.focus();
             await input.click({ clickCount: 3 });
-            await input.type(PROFILE.phone_formatted, { delay: 20 });
-            await input.evaluate(e => { e.dispatchEvent(new Event('input', { bubbles: true })); e.dispatchEvent(new Event('change', { bubbles: true })); });
-            log('  ✓ Filled system phone field');
+            await page.keyboard.type(PROFILE.phone_formatted, { delay: 40 });
+            const phoneVal = await input.evaluate(el => el.value).catch(() => '');
+            if (!phoneVal) {
+              await input.fill(PROFILE.phone_formatted);
+              await input.evaluate(e => { e.dispatchEvent(new Event('input', { bubbles: true })); e.dispatchEvent(new Event('change', { bubbles: true })); });
+            }
+            log('  ✓ Filled system phone field: ' + (await input.evaluate(el => el.value).catch(() => '?')));
             continue;
           }
           if (inputId === '_systemfield_linkedin' || inputName === '_systemfield_linkedin') {
+            await input.focus();
             await input.click({ clickCount: 3 });
-            await input.type(PROFILE.linkedin, { delay: 20 });
-            await input.evaluate(e => { e.dispatchEvent(new Event('input', { bubbles: true })); e.dispatchEvent(new Event('change', { bubbles: true })); });
+            await page.keyboard.type(PROFILE.linkedin, { delay: 40 });
+            const liVal = await input.evaluate(el => el.value).catch(() => '');
+            if (!liVal) {
+              await input.fill(PROFILE.linkedin);
+              await input.evaluate(e => { e.dispatchEvent(new Event('input', { bubbles: true })); e.dispatchEvent(new Event('change', { bubbles: true })); });
+            }
             log('  ✓ Filled system LinkedIn field');
             continue;
           }
@@ -1534,6 +1544,43 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
       }
     } catch(e) {
       log('  ⚠ Field interceptor: ' + e.message.slice(0, 50));
+    }
+
+    // ── Dedicated phone sweep ────────────────────────────────────────────────
+    // Runs after the main loop as a safety net — catches phone fields that
+    // didn't match _systemfield_phone or were skipped for any reason.
+    try {
+      const phoneSelectors = [
+        'input[name="_systemfield_phone"]',
+        'input[id="_systemfield_phone"]',
+        'input[type="tel"]',
+        'input[placeholder*="phone" i]',
+        'input[placeholder*="Phone" i]',
+        'input[aria-label*="phone" i]',
+        'input[autocomplete="tel"]',
+      ];
+      let phoneFilled = false;
+      for (const sel of phoneSelectors) {
+        const phoneInput = await page.$(sel).catch(() => null);
+        if (!phoneInput) continue;
+        if (!await phoneInput.isVisible().catch(() => false)) continue;
+        const existing = await phoneInput.evaluate(el => el.value).catch(() => '');
+        if (existing && existing.length > 5) { log('  ✓ Phone already filled: ' + existing); phoneFilled = true; break; }
+        await phoneInput.focus();
+        await phoneInput.click({ clickCount: 3 });
+        await page.keyboard.type(PROFILE.phone_formatted, { delay: 40 });
+        const val = await phoneInput.evaluate(el => el.value).catch(() => '');
+        if (!val) {
+          await phoneInput.fill(PROFILE.phone_formatted);
+          await phoneInput.evaluate(e => { e.dispatchEvent(new Event('input', { bubbles: true })); e.dispatchEvent(new Event('change', { bubbles: true })); });
+        }
+        log('  ✓ Phone sweep filled: ' + (await phoneInput.evaluate(el => el.value).catch(() => '?')) + ' via ' + sel);
+        phoneFilled = true;
+        break;
+      }
+      if (!phoneFilled) log('  ⚠ Phone field not found by sweep');
+    } catch(e) {
+      log('  ⚠ Phone sweep error: ' + e.message.slice(0, 50));
     }
 
     // Location field

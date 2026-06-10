@@ -1493,13 +1493,41 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
           
                     if (fillVal && fillVal !== currentVal) {
             await input.scrollIntoViewIfNeeded();
-            await input.click({ clickCount: 3 });
-            await input.type(fillVal, { delay: 15 });
-            await input.evaluate(e => {
-              e.dispatchEvent(new Event('input', { bubbles: true }));
-              e.dispatchEvent(new Event('change', { bubbles: true }));
-              e.dispatchEvent(new Event('blur', { bubbles: true }));
-            });
+            // Lead with keyboard typing — goes through real browser input pipeline
+            // so React's onKeyDown/onInput/onChange all fire naturally.
+            // This is required for Ashby's controlled components.
+            // For long essay answers (>80 chars) use fill+events to avoid timeout.
+            try {
+              await input.focus();
+              await input.click({ clickCount: 3 }); // select-all existing text
+              if (fillVal.length <= 80) {
+                // Short values: type character-by-character so React state updates on each keystroke
+                await page.keyboard.type(fillVal, { delay: 40 });
+              } else {
+                // Long values: fill then fire synthetic events (fast, React still sees it)
+                await input.fill(fillVal);
+                await input.evaluate(el => {
+                  el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+                  el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+                  el.dispatchEvent(new FocusEvent('blur', { bubbles: true }));
+                });
+              }
+              // Confirm value stuck; if not, fall back to type
+              const confirmed = await input.evaluate(el => el.value).catch(() => '');
+              if (!confirmed || confirmed.length < 3) {
+                await input.fill('');
+                await input.type(fillVal.slice(0, 200), { delay: 20 }); // type enough to trigger validation
+              }
+            } catch(fe2) {
+              // Last resort: nativeInputValueSetter
+              await input.evaluate((el, val) => {
+                const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set
+                  || Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+                if (setter) setter.call(el, val); else el.value = val;
+                el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+              }, fillVal).catch(() => {});
+            }
             log('  ✓ Filled: ' + meta.slice(0, 40).trim());
           }
         } catch(fe) {}

@@ -308,15 +308,23 @@ async function pollForSecurityCode() {
       try {
         // Use explicit UTC timestamp to avoid timezone issues on GitHub Actions
         const afterTimestamp = Math.floor((Date.now() - 600000) / 1000); // 10 min ago in UTC epoch
+        // Use day-level query then filter by exact internalDate
+        const dayTimestamp = Math.floor(Date.now() / 86400000) * 86400;
         const res = await gmail.users.messages.list({
           userId: 'me',
-          q: `from:no-reply@us.greenhouse-mail.io after:${afterTimestamp}`,
-          maxResults: 5,
+          q: `from:no-reply@us.greenhouse-mail.io after:${dayTimestamp}`,
+          maxResults: 10,
         });
 
         if (res.data.messages && res.data.messages.length > 0) {
           for (const msg of res.data.messages) {
             const full = await gmail.users.messages.get({ userId: 'me', id: msg.id, format: 'full' });
+            // Skip emails older than 10 minutes
+            const internalDate = parseInt(full.data.internalDate || '0', 10);
+            if (internalDate < Date.now() - 600000) {
+              log('  📧 Skipping old email: ' + new Date(internalDate).toISOString());
+              continue;
+            }
             const snippet = full.data.snippet || '';
             const bodyData = full.data.payload?.body?.data || 
               full.data.payload?.parts?.[0]?.body?.data || '';
@@ -351,7 +359,9 @@ function getDropdownAnswer(labelText) {
 
   // Priority 1: Sponsorship/visa — must come first before any other matching
   if (c.includes('sponsor') || c.includes('visa') || c.includes('immigration') ||
-      c.includes('work authorization') || c.includes('future re')) return 'No';
+      c.includes('work authorization') || c.includes('future re') ||
+      c.includes('work permit') || c.includes('right to work support') ||
+      c.includes('additional right to work')) return 'No';
 
   // Priority 2: Work authorization — authorized/eligible to work
   if (c.includes('authorized') || c.includes('eligible to work') ||
@@ -367,9 +377,11 @@ function getDropdownAnswer(labelText) {
       c.includes('in-person') || c.includes('relocat') || c.includes('willing to work') ||
       c.includes('commit to being')) return 'Yes';
 
-  // Priority 5: Previously worked at company
+  // Priority 5: Previously worked at company / conflict of interest
   if (c.includes('previously worked') || c.includes('worked for') ||
-      c.includes('formerly') || c.includes('ever worked')) return 'No';
+      c.includes('formerly') || c.includes('ever worked') ||
+      c.includes('currently work for') || c.includes('do you work for') ||
+      c.includes('former employee') || c.includes('conflict of interest')) return 'No';
 
   // Priority 6: State/province/metro
   if (c.includes('state of residence') || c.includes('current state') ||
@@ -726,11 +738,53 @@ linkedin.com/in/aaron-filous`;
                   ).catch(() => null);
                   
                   if (trigger) {
+                    // First try: hidden native <select> fallback (bypasses React pointer issues)
+                    try {
+                      const hiddenSelect = await fieldContainer.$('select');
+                      if (hiddenSelect) {
+                        const opts = await hiddenSelect.$$eval('option', os => os.map(o => o.textContent.trim()));
+                        const match = opts.find(o => {
+                          const ol = o.toLowerCase();
+                          return ol.includes(answer.toLowerCase()) ||
+                            (answer === 'No' && (ol === 'no' || ol.startsWith('no,'))) ||
+                            (answer === 'Yes' && (ol === 'yes' || ol.startsWith('yes,'))) ||
+                            (answer === 'Decline' && ol.includes('decline')) ||
+                            (answer === 'I am not a protected veteran' && ol.includes('not a protected')) ||
+                            (answer === 'No, I do not have a disability' && ol.includes('do not have'));
+                        });
+                        if (match) {
+                          await hiddenSelect.selectOption({ label: match });
+                          await hiddenSelect.evaluate(el => el.dispatchEvent(new Event('change', { bubbles: true })));
+                          log(`  ✓ Native select: ${rawLabel.slice(0, 30)} -> ${match.slice(0, 25)}`);
+                          continue;
+                        }
+                      }
+                    } catch(nsErr) {}
+
                     const triggerVisible = await trigger.isVisible().catch(() => false);
                     if (triggerVisible) {
                       await trigger.scrollIntoViewIfNeeded();
                       await trigger.click({ timeout: 3000, force: true });
                       await page.waitForTimeout(600);
+                      
+                      // Keyboard fallback — type into inner React-Select input
+                      const innerInput = await trigger.$('input[type="text"], input[role="combobox"]').catch(() => null);
+                      if (innerInput && await innerInput.isVisible().catch(() => false)) {
+                        await innerInput.fill(answer);
+                        await page.waitForTimeout(500);
+                        const kbOpts = await page.$$('[role="option"]');
+                        let kbPicked = false;
+                        for (const opt of kbOpts) {
+                          const t = (await opt.innerText().catch(() => '')).toLowerCase();
+                          if (t.includes(answer.toLowerCase().slice(0, 15))) {
+                            await opt.click({ timeout: 1500 });
+                            kbPicked = true;
+                            break;
+                          }
+                        }
+                        if (!kbPicked) await page.keyboard.press('Enter').catch(() => {});
+                        if (kbPicked) { log(`  ✓ React dropdown (keyboard): ${rawLabel.slice(0, 30)}`); continue; }
+                      }
 
                       const answer_lower = answer.toLowerCase();
                       const options = await page.$$('[role="option"], [class*="option"], ul[role="listbox"] li');
@@ -1470,7 +1524,11 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
         }).catch(() => '');
         // Skip SMS/marketing consent checkboxes
         if (/sms|text message|marketing|promotional/.test(label)) continue;
-        await cb.evaluate(el => el.click());
+        // Accept confidential info, privacy policy, terms checkboxes
+        if (/confidential|privacy policy|terms|acknowledge|agree|certify|consent/.test(label) || label === '') {
+          await cb.evaluate(el => el.click());
+          log('  ✓ Checked: ' + label.slice(0, 40));
+        }
       }
     } catch(e) {}
 

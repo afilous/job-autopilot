@@ -255,7 +255,7 @@ async function main() {
       log(`  💥 Exception: ${err.message}`);
       await page.screenshot({ path: `/tmp/error-${job.id}.png`, fullPage: true }).catch(() => {});
       const html = await page.content().catch(() => '');
-      if (html) fs.writeFileSync(`/tmp/error-${job.id}.html`, html.slice(0, 50000));
+      if (html) fs.writeFileSync(`/tmp/debug-error-${job.id}.html`, html.slice(0, 50000));
       await supabase.from('applications').update({ status: 'failed', notes: `Exception: ${err.message}` }).eq('id', job.id);
       failed++;
     } finally {
@@ -402,8 +402,9 @@ function getDropdownAnswer(labelText) {
   // Priority 8: Education dropdowns
   if (c.includes('school') || c.includes('university') || c.includes('college') || 
       c.includes('institution')) return 'Georgetown University';
-  if (c.includes('degree') || c.includes('level of education')) return "Master's";
-  if (c.includes('discipline') || c.includes('field of study') || c.includes('major')) return 'European Studies';
+  if (c.includes('degree') || c.includes('level of education') || c.includes('highest.*degree') || c.includes('degree.*obtained')) return "Master's";
+  if (c.includes('discipline') || c.includes('field of study') || c.includes('major') || c.includes('area of study')) return 'European Studies';
+  if (c.includes('graduation') || c.includes('grad year') || c.includes('year.*degree')) return '2015';
 
   // Priority 9: AI policy
   if (c.includes('ai policy') || c.includes('artificial intelligence policy') ||
@@ -472,7 +473,7 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
 
     // Save debug HTML to understand form structure
     const debugHtml = await page.content();
-    fs.writeFileSync('/tmp/greenhouse-debug.html', debugHtml.slice(0, 100000));
+    fs.writeFileSync(`/tmp/debug-greenhouse-${Date.now()}.html`, debugHtml.slice(0, 100000));
     log(`  📄 Debug HTML saved (${debugHtml.length} chars)`);
 
     // Check what form fields actually exist
@@ -486,6 +487,13 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
     const formExists = await page.$('form, #application-form, .application-form, #main_fields');
     if (!formExists) {
       return { success: false, message: `No form found at ${finalUrl}` };
+    }
+    
+    // Check for CAPTCHA
+    const ghCaptcha = await page.$('#g-recaptcha, .g-recaptcha, #h-captcha, .h-captcha, iframe[src*="recaptcha"], iframe[src*="hcaptcha"]').catch(() => null);
+    if (ghCaptcha) {
+      log('  ⚠ CAPTCHA detected — cannot submit automatically');
+      return { success: false, manual: true, message: 'CAPTCHA wall detected' };
     }
 
     // Standard fields — new Greenhouse form uses different IDs
@@ -1038,7 +1046,7 @@ linkedin.com/in/aaron-filous`;
     const submitBtn = page.locator('#submit_app, input[type="submit"][value*="Submit" i], button[type="submit"]').first();
     if (await submitBtn.count() === 0) {
       const html = await page.content();
-      fs.writeFileSync('/tmp/greenhouse-debug.html', html.slice(0, 50000));
+      fs.writeFileSync(`/tmp/debug-greenhouse-${Date.now()}.html`, html.slice(0, 50000));
       return { success: false, message: 'Submit button not found' };
     }
 
@@ -1144,7 +1152,7 @@ linkedin.com/in/aaron-filous`;
     // Save debug artifacts
     await page.screenshot({ path: '/tmp/greenhouse-debug.png', fullPage: true }).catch(() => {});
     const html = await page.content();
-    fs.writeFileSync('/tmp/greenhouse-debug.html', html.slice(0, 50000));
+    fs.writeFileSync(`/tmp/debug-greenhouse-${Date.now()}.html`, html.slice(0, 50000));
     return { success: false, message: `No confirmation at ${afterUrl}` };
 
   } catch (err) {
@@ -1456,6 +1464,7 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
           else if (/country.*reside|country.*currently|currently.*reside|reside.*country/.test(meta)) fillVal = 'United States';
           else if (/country/.test(meta) && meta.length < 100) fillVal = 'United States';
           else if (/require.*sponsor|sponsor.*work|visa.*sponsor|need.*sponsor/.test(meta)) fillVal = 'No';
+          else if (/legal.*permanent.*resid|permanent.*resid.*countries|hold.*permanent.*resid/.test(meta)) fillVal = 'United States';
           else if (/your pronouns|pronouns/.test(meta)) fillVal = 'He/Him';
           else if (/legal.*first.*last|legal.*name|full.*legal/.test(meta)) fillVal = PROFILE.full_name;
           else if (/preferred.*first|first.*preferred/.test(meta)) fillVal = PROFILE.first_name;
@@ -1996,7 +2005,8 @@ async function uploadResumePdf(page, pdfUrl, selectors) {
 }
 
 function saveLog() {
-  fs.writeFileSync('run-log.json', JSON.stringify(runLog, null, 2));
+  const logPath = `/tmp/submission-log-${Date.now()}.json`;
+  fs.writeFileSync(logPath, JSON.stringify(runLog, null, 2));
   log(`\n📝 Run log saved`);
 }
 

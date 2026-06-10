@@ -1157,15 +1157,21 @@ async function submitLever(page, job, resumeText, resumePdfUrl, focus) {
     ]).catch(() => null);
 
     // Submit with humanized click
-    for (const sel of ['button[data-qa="btn-submit"]', '.lever-button-black[type="submit"]', 'button[type="submit"]', 'input[type="submit"]']) {
+    let leverSubmitted = false;
+    for (const sel of ['button[data-qa="btn-submit"]', '.lever-button-black[type="submit"]', 'button[type="submit"]', 'input[type="submit"]', 'button:has-text("Submit Application")', 'button:has-text("Apply")']) {
       const btn = await page.$(sel);
-      if (btn) {
+      if (btn && await btn.isVisible().catch(() => false)) {
         await btn.scrollIntoViewIfNeeded();
         await btn.hover();
         await page.waitForTimeout(Math.floor(Math.random() * 300 + 100));
         await btn.click({ delay: Math.floor(Math.random() * 100 + 50) });
+        log(`  🖱 Lever submit clicked: ${sel}`);
+        leverSubmitted = true;
         break;
       }
+    }
+    if (!leverSubmitted) {
+      log('  ⚠ No Lever submit button found');
     }
 
     const leverResult = await leverPromise;
@@ -1287,7 +1293,10 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
           else if (/years.*experience.*qualify|fall.*within.*qualifying|qualifying.*range/.test(meta)) fillVal = 'Yes';
           else if (/current.*company|most recent.*company|recent employer/.test(meta)) fillVal = 'Stealth Startup';
           else if (/proud of|exceptional performance|something you/.test(meta)) fillVal = ESSAY_ANSWER;
+          else if (/why harper|why.*specifically|what attracted you|what about.*mission|what.*pulls you/.test(meta)) fillVal = 'I am drawn to Harper because rebuilding a broken industry with AI from first principles is exactly the kind of high-stakes zero-to-one challenge I thrive in. My background building Promotable to $40k\/month and leading a $200M portfolio consolidation at Enova has prepared me for messy zero-to-one problems. I want to prove AI-native operations can replace legacy manual processes at scale.';
           else if (/what excites you|why.*want.*work|why do you want|why.*company|why.*role|why.*position|why.*join|why.*interest|most excit|drawn to|why baseten|why elevenlabs|why watershed|why cognition|why harvey/.test(meta)) fillVal = 'I am excited by the opportunity to apply my 10+ years of strategy and operations experience at a company building at the frontier. At Enova International I led a $200M portfolio consolidation and drove 200% increase in SDR productivity. I founded Promotable which grew to $40k/month revenue. I am drawn to this role because it combines my passion for building scalable operational systems with a high-growth mission-driven environment.';
+          else if (/messy.*ambiguous|ambiguous.*thing|personally owned.*drove|mess.*what did you|hardest part/.test(meta)) fillVal = 'At Enova I was handed a vague directive to wind down a $200M business unit with no playbook. I scoped the full initiative myself, identified every cross-functional dependency across legal, compliance, product, finance and customer success, built the project plan, and drove it to completion. The hardest part was managing stakeholder resistance from teams whose priorities conflicted with the wind-down timeline — I resolved it through persistent one-on-ones and clear escalation to the COO.';
+          else if (/beyond your title|went beyond|no one asked|took on that|rotates you across|real work/.test(meta)) fillVal = 'At App Academy I was hired as a Business Operations Manager but ended up managing state regulatory relationships, running the financial audit conversion to GAAP, and building the entire CS team from scratch — none of which was in my job description. I did it because the problems were there and no one else was owning them. At Promotable I wore every hat simultaneously — sales, ops, marketing, product — because that was what the business needed.';
           else if (/program.*end.to.end|execute.*program|responsible for.*program|program you.*own/.test(meta)) fillVal = 'At Enova International I led a major cross-functional initiative to close and consolidate a business unit with a $200M loan portfolio. I owned the program end-to-end: scoping with the COO, building the project plan, coordinating across legal, compliance, finance, product, and customer success, and managing weekly stakeholder reporting. Day-to-day I ran cross-functional standups, resolved blockers, and owned all executive communications. The program completed on time with full regulatory compliance and significant cost structure reduction.';
           else if (/measure success|metrics.*mattered|how did you measure|signals.*metrics|results.*change/.test(meta)) fillVal = 'I tracked leading indicators alongside outcomes. For the Enova consolidation I monitored milestone completion rate, stakeholder alignment, and risk items resolved per sprint. Post-completion I measured cost reduction vs. target, compliance audit pass rate, and team retention through transition. When data showed resource allocation was inefficient mid-program I restructured workstream priorities which improved our timeline by three weeks.';
           else if (/technical audience|platform team|technical leader|developer audience|adapt.*messaging|marketed.*technical/.test(meta)) fillVal = 'At Kixie I worked directly with engineering and product leaders to implement new GTM processes and CRM infrastructure. I adapted by leading with data and system logic, using technical terminology accurately, and presenting tradeoffs in terms of implementation complexity. Building trust by understanding technical constraints before proposing solutions made cross-functional alignment significantly faster.';
@@ -1332,13 +1341,18 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
       }
     } catch(e) {}
 
-    // Check and click any consent/privacy checkboxes
+    // Check and click any consent/privacy checkboxes (skip SMS consent - pick No)
     try {
       const checkboxes = await page.$$('input[type="checkbox"]');
       for (const cb of checkboxes) {
-        if (!await cb.isChecked().catch(() => true)) {
-          await cb.evaluate(el => el.click());
-        }
+        if (await cb.isChecked().catch(() => true)) continue;
+        const label = await cb.evaluate(el => {
+          const lbl = document.querySelector(`label[for="${el.id}"]`);
+          return (lbl?.innerText || el.closest('label')?.innerText || '').toLowerCase();
+        }).catch(() => '');
+        // Skip SMS/marketing consent checkboxes
+        if (/sms|text message|marketing|promotional/.test(label)) continue;
+        await cb.evaluate(el => el.click());
       }
     } catch(e) {}
 

@@ -1,22 +1,22 @@
 {
   "name": "job-autopilot",
-  "version": "1.0.0",
-  "description": "Automated job discovery and application submission",
+  "version": "2.0.0",
+  "description": "Automated job application pipeline",
   "main": "submit.js",
   "scripts": {
-    "discover:api": "node discover-jobs-api.js",
-    "discover:search": "node discover-jobs.js",
     "submit": "node submit.js",
-    "submit:dry": "node submit.js --dry-run"
+    "submit:dry": "node submit.js --dry-run",
+    "discover:api": "node discover-jobs-api.js",
+    "discover:search": "node discover-jobs.js"
   },
   "dependencies": {
-    "googleapis": "^144.0.0",
     "@supabase/supabase-js": "^2.39.0",
+    "googleapis": "^144.0.0",
+    "node-fetch": "^3.3.2",
     "playwright": "^1.44.0",
     "playwright-extra": "^4.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
-    "rebrowser-playwright": "^1.44.1",
-    "node-fetch": "^3.3.2"
+    "rebrowser-playwright": "^1.44.1"
   },
   "engines": {
     "node": ">=20.0.0"

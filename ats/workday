@@ -1,0 +1,64 @@
+/**
+ * ats/workday.js — Workday application handler
+ * 
+ * Workday detection: URLs containing /recruiting/ or myworkdayjobs.com
+ * Each company hosts their own Workday instance so there's no central domain.
+ * 
+ * Status: Skeleton — implementation pending
+ * Priority fields: name, email, phone, resume upload, work authorization, source
+ */
+
+const { PROFILE, ESSAY_ANSWERS } = require('../lib/profile');
+const { fillReactField, humanType, humanizedClick, tryFillByLabel } = require('../lib/helpers');
+const { uploadResume } = require('../lib/resume');
+const { handleCaptcha } = require('../lib/captcha');
+
+function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
+
+// Detect if a URL is a Workday application
+function isWorkdayUrl(url) {
+  return url.includes('myworkdayjobs.com') || url.includes('/recruiting/') || url.includes('wd1.myworkday') || url.includes('wd3.myworkday') || url.includes('wd5.myworkday');
+}
+
+async function submitWorkday(page, job, resumeText, resumePdfUrl) {
+  try {
+    log(`  🌐 ${job.url}`);
+    await page.goto(job.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(3000); // Workday loads slowly
+
+    const finalUrl = page.url();
+    log(`  📍 Loaded: ${finalUrl}`);
+
+    // Workday often requires account creation — check for sign-in wall
+    const signInRequired = await page.$('input[data-automation-id="email"], [data-automation-id="signInButton"]').catch(() => null);
+    if (signInRequired) {
+      log('  ⚠ Workday account required — marking manual');
+      return { success: false, manual: true, message: 'Workday account creation required' };
+    }
+
+    // Check for CAPTCHA
+    const captchaEl = await page.$('iframe[src*="hcaptcha"],iframe[src*="recaptcha"]').catch(() => null);
+    if (captchaEl) {
+      log('  🧩 CAPTCHA detected — attempting solve...');
+      const solved = await handleCaptcha(page);
+      if (!solved) return { success: false, manual: true, message: 'CAPTCHA wall detected' };
+      await page.waitForTimeout(2000);
+    }
+
+    // TODO: Implement full Workday form filling
+    // Workday uses data-automation-id attributes for reliable field targeting
+    // Key selectors:
+    //   Name: input[data-automation-id="legalNameSection_firstName"]
+    //   Email: input[data-automation-id="email"]
+    //   Phone: input[data-automation-id="phone"]
+    //   Resume: input[type="file"]
+    //   How did you hear: [data-automation-id="source"]
+    //   Work auth: [data-automation-id="workAuthorization"]
+
+    log('  ⚠ Workday handler not yet implemented — marking manual');
+    return { success: false, manual: true, message: 'Workday: implementation pending' };
+
+  } catch(err) { return { success: false, message: `Workday error: ${err.message}` }; }
+}
+
+module.exports = { submitWorkday, isWorkdayUrl };

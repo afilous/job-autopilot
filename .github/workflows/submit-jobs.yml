@@ -1,30 +1,42 @@
 name: Job Autopilot — Submit Applications
+
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '0 */3 * * *'  # Every 3 hours automatically
+
 jobs:
   submit:
     runs-on: ubuntu-latest
     name: submit
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
+
       - name: Install dependencies
         run: npm install
+
       - name: Install Playwright browsers
         run: npx playwright install chromium --with-deps
-      - name: Run node submit.js
+
+      - name: Run submissions
         timeout-minutes: 15
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
           GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
           GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          CAPSOLVER_API_KEY: ${{ secrets.CAPSOLVER_API_KEY }}
+          MAX_SUBMISSIONS: '20'
+          MIN_SCORE: '75'
         run: node submit.js
-      - name: Upload submission log
+
+      - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -32,3 +44,6 @@ jobs:
           path: |
             /tmp/submission-log-*.json
             /tmp/debug-*.html
+            /tmp/ashby-debug.png
+            /tmp/lever-debug.png
+            /tmp/greenhouse-debug.png

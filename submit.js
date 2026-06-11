@@ -1,11 +1,30 @@
 /**
  * Job Autopilot — Automated Application Submission
- * Incorporates all Gemini insights and confirmed ATS mechanics
  */
 
-const { chromium } = require('playwright');
+const { chromium: vanillaChromium } = require('playwright');
 const { createClient } = require('@supabase/supabase-js');
 const fs = require('fs');
+
+// Stealth browser setup — masks automation fingerprints
+let stealthChromium;
+try {
+  const { chromium: extraChromium } = require('playwright-extra');
+  const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+  extraChromium.use(StealthPlugin());
+  stealthChromium = extraChromium;
+  console.log('[stealth] playwright-extra + stealth plugin loaded');
+} catch(e) {
+  console.log('[stealth] playwright-extra not available, falling back to rebrowser-playwright');
+  try {
+    const { chromium: reChromium } = require('rebrowser-playwright');
+    stealthChromium = reChromium;
+    console.log('[stealth] rebrowser-playwright loaded');
+  } catch(e2) {
+    console.log('[stealth] no stealth browser available, using vanilla playwright');
+    stealthChromium = vanillaChromium;
+  }
+}
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
@@ -34,7 +53,7 @@ const PROFILE = {
   state: 'CA',
   zip: '94401',
   country: 'United States',
-  website: 'https://www.linkedin.com/in/aaron-filous/',
+  website: 'https://frameandreel.com',
   heard_about: 'LinkedIn',
   authorized_to_work: 'Yes',
   requires_sponsorship: 'No',
@@ -56,6 +75,26 @@ const runLog = { started_at: new Date().toISOString(), dry_run: DRY_RUN, results
 function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function randomFocus() { return FOCUS_ELEMENTS[Math.floor(Math.random() * FOCUS_ELEMENTS.length)]; }
+
+// Humanized mouse click — drifts pointer naturally to avoid bot detection
+async function humanizedClick(page, elementOrSelector) {
+  try {
+    const el = typeof elementOrSelector === 'string'
+      ? await page.$(elementOrSelector)
+      : elementOrSelector;
+    if (!el) return false;
+    const box = await el.boundingBox();
+    if (!box) { await el.click(); return true; }
+    const x = box.x + box.width * (0.3 + Math.random() * 0.4);
+    const y = box.y + box.height * (0.3 + Math.random() * 0.4);
+    await page.mouse.move(x, y, { steps: 5 });
+    await page.waitForTimeout(40 + Math.floor(Math.random() * 60));
+    await page.mouse.down();
+    await page.waitForTimeout(40 + Math.floor(Math.random() * 60));
+    await page.mouse.up();
+    return true;
+  } catch(e) { return false; }
+}
 
 async function main() {
   log(DRY_RUN ? '🔍 DRY RUN mode' : '🚀 Starting job submission run');
@@ -91,7 +130,7 @@ async function main() {
   RESUME_VARIANTS.default = resumeData?.pdf_url || null;
   log(`📄 Resume: ${resumeData?.filename || 'default'}`);
 
-  const browser = await chromium.launch({
+  const browser = await stealthChromium.launch({
     headless: true,
     args: [
       '--no-sandbox',
@@ -99,6 +138,7 @@ async function main() {
       '--disable-blink-features=AutomationControlled',
       '--disable-dev-shm-usage',
       '--disable-infobars',
+      '--window-size=1920,1080',
     ],
   });
 
@@ -122,49 +162,34 @@ async function main() {
     log(`  Score: ${job.match_score}% | Variant: ${job.resume_variant || 'default'}`);
 
     try {
-      const check = await fetch(job.url, {
-        method: 'HEAD',
-        redirect: 'manual',
-        signal: AbortSignal.timeout(5000),
-      });
+      const check = await fetch(job.url, { method: 'HEAD', redirect: 'manual', signal: AbortSignal.timeout(5000) });
       if ([404, 410].includes(check.status)) {
         log(`  ⚰ Job gone (${check.status}) — archiving`);
         await supabase.from('applications').update({ status: 'archived', notes: `HTTP ${check.status}` }).eq('id', job.id);
-        skipped++;
-        continue;
+        skipped++; continue;
       }
       if ([301, 302].includes(check.status) && job.ats_type === 'lever') {
         const loc = check.headers.get('location') || '';
         if (!loc.includes(job.external_id)) {
           log(`  ⚰ Lever job redirected away — archiving`);
           await supabase.from('applications').update({ status: 'archived', notes: 'Lever 302 redirect' }).eq('id', job.id);
-          skipped++;
-          continue;
+          skipped++; continue;
         }
       }
-    } catch (e) {
-      log(`  ⚠ Pre-flight failed: ${e.message} — continuing`);
-    }
+    } catch (e) { log(`  ⚠ Pre-flight failed: ${e.message} — continuing`); }
 
     if (DRY_RUN) {
       log('  ⏭ DRY RUN — skipping');
       runLog.results.push({ job_id: job.id, status: 'dry_run' });
-      skipped++;
-      continue;
+      skipped++; continue;
     }
 
     const { data: claimed } = await supabase
       .from('applications')
       .update({ status: 'processing', started_at: new Date().toISOString() })
-      .eq('id', job.id)
-      .eq('status', 'queued')
-      .select();
+      .eq('id', job.id).eq('status', 'queued').select();
 
-    if (!claimed || claimed.length === 0) {
-      log(`  ⏭ Already claimed by another run — skipping`);
-      skipped++;
-      continue;
-    }
+    if (!claimed || claimed.length === 0) { log(`  ⏭ Already claimed — skipping`); skipped++; continue; }
 
     const variantKey = job.resume_variant || 'default';
     const resumePdfUrl = RESUME_VARIANTS[variantKey] || RESUME_VARIANTS.default;
@@ -172,7 +197,7 @@ async function main() {
     const context = await browser.newContext({
       bypassCSP: true,
       userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      viewport: { width: 1440, height: 900 },
+      viewport: { width: 1920, height: 1080 },
       deviceScaleFactor: 2,
       hasTouch: false,
       locale: 'en-US',
@@ -190,6 +215,16 @@ async function main() {
       window.chrome = { runtime: {} };
       Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
       Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    });
+
+    // Block images/fonts/stylesheets to save proxy bandwidth and speed up runs
+    await page.route('**/*', (route) => {
+      const resourceType = route.request().resourceType();
+      if (['image', 'media', 'font'].includes(resourceType)) {
+        route.abort();
+      } else {
+        route.continue();
+      }
     });
 
     page.on('console', msg => { if (msg.type() === 'error') log(`  🖥 ${msg.text()}`); });
@@ -210,30 +245,21 @@ async function main() {
 
       if (result.duplicate) {
         await supabase.from('applications').update({ status: 'duplicate', notes: result.message }).eq('id', job.id);
-        log(`  ♻ ${result.message}`);
-        duplicate++;
+        log(`  ♻ ${result.message}`); duplicate++;
         runLog.results.push({ job_id: job.id, company: job.company, status: 'duplicate' });
       } else if (result.manual) {
         await supabase.from('applications').update({ status: 'manual', notes: result.message }).eq('id', job.id);
-        log(`  📋 Manual: ${result.message}`);
-        manual++;
+        log(`  📋 Manual: ${result.message}`); manual++;
         runLog.results.push({ job_id: job.id, company: job.company, status: 'manual' });
       } else if (result.success) {
-        await supabase.from('applications').update({
-          status: 'submitted',
-          submission_time: Math.floor(Date.now() / 1000),
-          notes: result.message,
-        }).eq('id', job.id);
-        log(`  ✅ ${result.message}`);
-        submitted++;
+        await supabase.from('applications').update({ status: 'submitted', submission_time: Math.floor(Date.now() / 1000), notes: result.message }).eq('id', job.id);
+        log(`  ✅ ${result.message}`); submitted++;
         runLog.results.push({ job_id: job.id, company: job.company, status: 'submitted' });
       } else {
         await supabase.from('applications').update({ status: 'failed', notes: result.message }).eq('id', job.id);
-        log(`  ❌ ${result.message}`);
-        failed++;
+        log(`  ❌ ${result.message}`); failed++;
         runLog.results.push({ job_id: job.id, company: job.company, status: 'failed', message: result.message });
       }
-
     } catch (err) {
       log(`  💥 Exception: ${err.message}`);
       await page.screenshot({ path: `/tmp/error-${job.id}.png`, fullPage: true }).catch(() => {});
@@ -274,21 +300,14 @@ async function pollForSecurityCode() {
   }
   try {
     const { google } = require('googleapis');
-    const oauth2Client = new google.auth.OAuth2(
-      process.env.GMAIL_CLIENT_ID,
-      process.env.GMAIL_CLIENT_SECRET
-    );
+    const oauth2Client = new google.auth.OAuth2(process.env.GMAIL_CLIENT_ID, process.env.GMAIL_CLIENT_SECRET);
     oauth2Client.setCredentials({ refresh_token: process.env.GMAIL_REFRESH_TOKEN });
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
     const startTime = Date.now();
     while (Date.now() - startTime < 60000) {
       try {
         const dayTimestamp = Math.floor(Date.now() / 86400000) * 86400;
-        const res = await gmail.users.messages.list({
-          userId: 'me',
-          q: `from:no-reply@us.greenhouse-mail.io after:${dayTimestamp}`,
-          maxResults: 10,
-        });
+        const res = await gmail.users.messages.list({ userId: 'me', q: `from:no-reply@us.greenhouse-mail.io after:${dayTimestamp}`, maxResults: 10 });
         if (res.data.messages && res.data.messages.length > 0) {
           for (const msg of res.data.messages) {
             const full = await gmail.users.messages.get({ userId: 'me', id: msg.id, format: 'full' });
@@ -309,9 +328,7 @@ async function pollForSecurityCode() {
       } catch(e) {}
       await new Promise(r => setTimeout(r, 3000));
     }
-  } catch(e) {
-    log('  ⚠ Gmail polling error: ' + e.message);
-  }
+  } catch(e) { log('  ⚠ Gmail polling error: ' + e.message); }
   return null;
 }
 
@@ -333,32 +350,25 @@ function getDropdownAnswer(labelText) {
       c.includes('formerly') || c.includes('ever worked') ||
       c.includes('currently work for') || c.includes('do you work for') ||
       c.includes('former employee') || c.includes('conflict of interest')) return 'No';
-  if (c.includes('state of residence') || c.includes('current state') ||
-      c.includes('province')) return 'California';
-  if (c.includes('metro') || c.includes('san francisco bay') ||
-      c.includes('based in sf') || c.includes('based in san francisco')) return 'San Francisco Bay';
+  if (c.includes('state of residence') || c.includes('current state') || c.includes('province')) return 'California';
+  if (c.includes('metro') || c.includes('san francisco bay') || c.includes('based in sf') || c.includes('based in san francisco')) return 'San Francisco Bay';
   if (c.includes('veteran')) return 'I am not a protected veteran';
   if (c.includes('disability')) return 'No, I do not have a disability';
   if (c.includes('gender') || c.includes('race') || c.includes('ethnicity') ||
       c.includes('ethnic') || c.includes('sexual orientation') || c.includes('lgbtq') ||
       c.includes('transgender') || c.includes('identify as') || c.includes('identify my') ||
       c.includes('lgbtqia') || c.includes('pronoun')) return 'Decline';
-  if (c.includes('school') || c.includes('university') || c.includes('college') ||
-      c.includes('institution')) return 'Georgetown University';
+  if (c.includes('school') || c.includes('university') || c.includes('college') || c.includes('institution')) return 'Georgetown University';
   if (c.includes('degree') || c.includes('level of education') || c.includes('highest.*degree') || c.includes('degree.*obtained')) return "Master's";
   if (c.includes('discipline') || c.includes('field of study') || c.includes('major') || c.includes('area of study')) return 'European Studies';
   if (c.includes('graduation') || c.includes('grad year') || c.includes('year.*degree')) return '2015';
-  if (c.includes('ai policy') || c.includes('artificial intelligence policy') ||
-      c.includes('use of ai') || c.includes('ai tool') || c.includes('used ai')) return 'No';
-  if (c.includes('m&a') || c.includes('merger') || c.includes('acquisition') ||
-      c.includes('deal process') || c.includes('negotiating')) return 'No';
+  if (c.includes('ai policy') || c.includes('artificial intelligence policy') || c.includes('use of ai') || c.includes('ai tool') || c.includes('used ai')) return 'No';
+  if (c.includes('m&a') || c.includes('merger') || c.includes('acquisition') || c.includes('deal process') || c.includes('negotiating')) return 'No';
   if (c.includes('first-generation') || c.includes('first generation professional')) return 'Decline';
-  if (c.includes('hear about') || c.includes('how did you') ||
-      c.includes('source') || c.includes('referred')) return 'LinkedIn';
+  if (c.includes('hear about') || c.includes('how did you') || c.includes('source') || c.includes('referred')) return 'LinkedIn';
   if (c.includes('sql') || c.includes('advanced knowledge')) return 'Yes';
   if (c.includes('ai tool') || c.includes('artificial intelligence')) return 'Yes';
-  if (c.includes('do you') || c.includes('are you') || c.includes('can you') ||
-      c.includes('will you') || c.includes('have you')) return 'Yes';
+  if (c.includes('do you') || c.includes('are you') || c.includes('can you') || c.includes('will you') || c.includes('have you')) return 'Yes';
   return null;
 }
 
@@ -372,29 +382,20 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
     try {
       await page.waitForSelector('#application_form, #app, #first_name, input[id="first_name"]', { state: 'visible', timeout: 12000 });
       await page.waitForTimeout(1500);
-    } catch (e) { log('  ⚠ Form not found after 12s — checking page state'); }
+    } catch (e) { log('  ⚠ Form not found after 12s'); }
 
     const finalUrl = page.url();
     const finalDomain = new URL(finalUrl).hostname;
     if (!finalDomain.includes('greenhouse.io')) {
-      const knownCustomSites = ['fivetran.com', 'airbnb.com', 'okta.com', 'lyft.com',
-        'pinterestcareers.com', 'careerpuck.com', 'samsara.com', 'databricks.com'];
+      const knownCustomSites = ['fivetran.com','airbnb.com','okta.com','lyft.com','pinterestcareers.com','careerpuck.com','samsara.com','databricks.com'];
       if (knownCustomSites.some(s => finalDomain.includes(s))) {
-        try { await supabase.from('companies').update({ active: false, notes: 'custom career site — cannot automate' }).eq('ats_slug', job.ats_slug); } catch(e) {}
-        log(`  📋 Deactivated custom-site company: ${job.company}`);
+        try { await supabase.from('companies').update({ active: false, notes: 'custom career site' }).eq('ats_slug', job.ats_slug); } catch(e) {}
       }
       return { success: false, manual: true, message: `Custom site: ${finalDomain}` };
     }
 
     const debugHtml = await page.content();
     fs.writeFileSync(`/tmp/debug-greenhouse-${Date.now()}.html`, debugHtml.slice(0, 100000));
-    log(`  📄 Debug HTML saved (${debugHtml.length} chars)`);
-
-    const fieldIds = await page.evaluate(() => {
-      const inputs = document.querySelectorAll('input, textarea, select');
-      return [...inputs].map(el => ({ id: el.id, name: el.name, type: el.type, placeholder: el.placeholder })).filter(el => el.id || el.name);
-    });
-    log(`  📋 Form fields found: ${JSON.stringify(fieldIds.slice(0, 15))}`);
 
     const formExists = await page.$('form, #application-form, .application-form, #main_fields');
     if (!formExists) return { success: false, message: `No form found at ${finalUrl}` };
@@ -415,9 +416,8 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
         await locField.type(PROFILE.city, { delay: 50 }); await page.waitForTimeout(800);
         await page.keyboard.press('ArrowDown'); await page.waitForTimeout(300);
         await page.keyboard.press('Enter'); await page.waitForTimeout(300);
-        log(`  ✓ Location: ${PROFILE.city}`);
       }
-    } catch (e) { log(`  ⚠ Location field: ${e.message}`); }
+    } catch (e) { log(`  ⚠ Location: ${e.message}`); }
 
     try {
       const countryField = await page.$('#country, input[id*="country" i]');
@@ -426,20 +426,16 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
         await countryField.type('United States', { delay: 50 }); await page.waitForTimeout(1000);
         await page.keyboard.press('ArrowDown'); await page.waitForTimeout(300);
         await page.keyboard.press('Enter'); await page.waitForTimeout(500);
-        log('  ✓ Country: United States');
       } else {
         const countrySelect = await page.$('select[id*="country" i]');
-        if (countrySelect) {
-          await countrySelect.selectOption({ label: 'United States' }).catch(() => countrySelect.selectOption({ value: 'US' }).catch(() => {}));
-          log('  ✓ Country select: United States');
-        }
+        if (countrySelect) await countrySelect.selectOption({ label: 'United States' }).catch(() => countrySelect.selectOption({ value: 'US' }).catch(() => {}));
       }
-    } catch (e) { log(`  ⚠ Country field: ${e.message}`); }
+    } catch (e) { log(`  ⚠ Country: ${e.message}`); }
 
     for (const sel of ['input[name*="linkedin" i]','input[id*="linkedin" i]','input[placeholder*="linkedin" i]','input[id*="LinkedIn"]','[id="question_linkedin"]']) {
-      if (await humanType(page, sel, PROFILE.linkedin)) { log('  ✓ LinkedIn filled'); break; }
+      if (await humanType(page, sel, PROFILE.linkedin)) break;
     }
-    for (const sel of ['input[name*="website" i]', 'input[id*="website" i]']) {
+    for (const sel of ['input[name*="website" i]','input[id*="website" i]']) {
       if (await humanType(page, sel, PROFILE.website)) break;
     }
 
@@ -451,7 +447,7 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
         await coverLetterInput.setInputFiles(clPath);
         log('  📎 Cover letter uploaded');
       }
-    } catch(e) { log('  ⚠ Cover letter: ' + e.message); }
+    } catch(e) {}
 
     let resumeUploaded = false;
     if (resumePdfUrl) {
@@ -460,7 +456,6 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
         'input[type="file"][name="job_application[resume]"]','input[type="file"][accept*="pdf"]','input[type="file"]',
       ]);
       if (resumeUploaded) log(`  📎 Resume PDF uploaded`);
-      else log(`  ⚠ Resume PDF upload failed — falling back to text`);
     }
 
     const resumeTextFilled = await fillField(page, ['#resume_text','textarea[name="job_application[resume_text]"]','textarea[id*="resume"]'], resumeText.slice(0, 5000));
@@ -478,18 +473,18 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
           const labels = await field.$$('label');
           for (const label of labels) {
             const lt = (await label.textContent() || '').toLowerCase().trim();
-            if (lt === 'yes' || lt === 'true' || lt === 'i am' || lt === 'willing') { await label.click(); log('  ✓ Radio Yes: ' + fieldText.slice(0, 40)); break; }
+            if (lt === 'yes' || lt === 'true' || lt === 'i am' || lt === 'willing') { await label.click(); break; }
           }
         }
         if (/sponsorship|visa|sponsor/i.test(fieldText)) {
           const labels = await field.$$('label');
           for (const label of labels) {
             const lt = (await label.textContent() || '').toLowerCase().trim();
-            if (lt === 'no' || lt === 'false' || lt === 'i do not') { await label.click(); log('  ✓ Radio No: ' + fieldText.slice(0, 40)); break; }
+            if (lt === 'no' || lt === 'false' || lt === 'i do not') { await label.click(); break; }
           }
         }
       }
-    } catch(e) { log('  ⚠ Radio sweep: ' + e.message); }
+    } catch(e) {}
 
     await handleDropdownByText(page, /authorized.*work|work.*authorized/i, 'Yes');
     await handleDropdownByText(page, /require.*sponsorship|visa/i, 'No');
@@ -516,7 +511,6 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
             if (answer) {
               await el.selectOption({ label: answer }).catch(() => el.selectOption({ label: answer + ' to self-identify' }).catch(() => el.selectOption({ value: answer.toLowerCase() }).catch(() => el.selectOption({ index: 1 }).catch(() => {}))));
             } else { await el.selectOption({ index: 1 }).catch(() => {}); }
-            log('  ✓ Native select: ' + rawLabel.slice(0, 40));
           } else if (tag === 'textarea' || (tag === 'input' && !['file','hidden','radio','checkbox'].includes(inputType))) {
             const isHiddenBacking = await page.evaluate((id) => {
               const el = document.getElementById(id);
@@ -561,7 +555,6 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
                         if (match) {
                           await hiddenSelect.selectOption({ label: match });
                           await hiddenSelect.evaluate(el => el.dispatchEvent(new Event('change', { bubbles: true })));
-                          log(`  ✓ Native select: ${rawLabel.slice(0, 30)} -> ${match.slice(0, 25)}`);
                           continue;
                         }
                       }
@@ -581,7 +574,7 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
                           if (t.includes(answer.toLowerCase().slice(0, 15))) { await opt.click({ timeout: 1500 }); kbPicked = true; break; }
                         }
                         if (!kbPicked) await page.keyboard.press('Enter').catch(() => {});
-                        if (kbPicked) { log(`  ✓ React dropdown (keyboard): ${rawLabel.slice(0, 30)}`); continue; }
+                        if (kbPicked) continue;
                       }
                       const answer_lower = answer.toLowerCase();
                       const options = await page.$$('[role="option"], [class*="option"], ul[role="listbox"] li');
@@ -597,39 +590,36 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
                             (answer === 'LinkedIn' && optText.includes('linkedin')) ||
                             (answer === 'I am not a protected veteran' && (optText.includes('not a protected') || optText.includes('not a veteran') || optText.includes('i am not'))) ||
                             (answer === 'No, I do not have a disability' && (optText.includes('do not have') || optText.includes('no disability') || optText.startsWith('no, i')))) {
-                          await opt.click({ timeout: 1500 }); picked = true;
-                          log('  ✓ React dropdown [' + answer + ']: ' + rawLabel.slice(0, 40)); break;
+                          await opt.click({ timeout: 1500 }); picked = true; break;
                         }
                       }
                       if (!picked && options.length > 0) {
                         for (const opt of options) {
                           const optText = (await opt.innerText().catch(() => '')).trim();
                           if (optText && !optText.toLowerCase().includes('select') && !optText.toLowerCase().includes('not in the us') && !optText.toLowerCase().includes('choose')) {
-                            await opt.click({ timeout: 1500 }); log('  ✓ React dropdown (first): ' + optText.slice(0, 30)); picked = true; break;
+                            await opt.click({ timeout: 1500 }); picked = true; break;
                           }
                         }
                       }
-                      if (!picked) log('  ⚠ No options found for: ' + rawLabel.slice(0, 30));
                       await page.waitForTimeout(200);
-                    } else { log('  ⚠ Trigger not visible: ' + rawLabel.slice(0, 30)); }
+                    }
                   } else {
-                    log('  ⚠ No css- trigger found, trying direct click: ' + rawLabel.slice(0, 30));
                     try {
                       await el.click({ timeout: 2000 }); await page.waitForTimeout(400);
                       const options = await page.$$('[role="option"]');
                       for (const opt of options) {
                         const optText = (await opt.innerText().catch(() => '')).toLowerCase().trim();
-                        if (optText.includes(answer.toLowerCase())) { await opt.click({ timeout: 1500 }); log('  ✓ Direct click dropdown: ' + optText.slice(0, 30)); break; }
+                        if (optText.includes(answer.toLowerCase())) { await opt.click({ timeout: 1500 }); break; }
                       }
                     } catch(ce) {}
                   }
-                } catch(e) { log('  ⚠ React dropdown error (' + e.message.slice(0, 40) + '): ' + rawLabel.slice(0, 30)); }
+                } catch(e) {}
               }
             } else {
               let answer = null;
               const lt = labelText.toLowerCase();
               if (/linkedin/i.test(lt)) answer = PROFILE.linkedin;
-              else if (/website|portfolio|personal site/i.test(lt)) answer = PROFILE.linkedin;
+              else if (/website|portfolio|personal site/i.test(lt)) answer = PROFILE.website;
               else if (/github/i.test(lt)) answer = 'https://github.com/afilous';
               else if (/twitter|x\.com/i.test(lt)) answer = '';
               else if (/preferred.*name|name.*prefer|preferred first|first name/i.test(lt)) answer = PROFILE.first_name;
@@ -654,7 +644,7 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
               else if (/why.*you|what makes you|what.*qualif|fit for this/i.test(lt)) answer = 'My background spans strategy, operations, and cross-functional leadership at Enova International, Product School, App Academy, and Promotable. I consistently translate complex problems into scalable operational systems.';
               else if (/experience|background|describe|tell us about/i.test(lt)) answer = 'My background spans 10+ years in strategy and operations roles. At Enova International I led a $200M portfolio consolidation, built SDR operations from the ground up, and drove cross-functional alignment across product, finance, and go-to-market teams.';
               else if (/sql/i.test(lt)) answer = 'Yes, I have advanced SQL skills including complex joins, window functions, and query optimization.';
-              else if (/cover.*letter|additional.*info|anything.*else|other.*information/i.test(lt)) answer = 'Please see my attached cover letter and resume for additional details about my background and qualifications.';
+              else if (/cover.*letter|additional.*info|anything.*else|other.*information/i.test(lt)) answer = 'Please see my attached cover letter and resume for additional details.';
               else if (/hear.*about|how.*find|source|referred/i.test(lt)) answer = 'LinkedIn';
               else if (/familiar.*with|how familiar/i.test(lt)) answer = 'Somewhat familiar';
               else if (/acknowledge|confirm|agree|certify/i.test(lt)) answer = 'Yes';
@@ -665,15 +655,13 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
                 for (const [q, a] of Object.entries(responses)) {
                   if (lt.includes(q.toLowerCase().slice(0, 20))) {
                     const aStr = String(a).toLowerCase();
-                    const mentionsWrongCompany = aStr.includes('why ' + companyName) === false &&
-                      ['anthropic','faire','intercom','figma','affirm','gusto','chime','verkada','mixpanel','amplitude','wonderschool','loop','waymo','ramp'].some(c => c !== companyName && aStr.includes(c));
+                    const mentionsWrongCompany = ['anthropic','faire','intercom','figma','affirm','gusto','chime','verkada','mixpanel','amplitude','wonderschool','loop','waymo','ramp'].some(c => c !== companyName && aStr.includes(c));
                     if (!mentionsWrongCompany) { answer = String(a); break; }
                   }
                 }
                 if (!answer) answer = 'Please see my attached resume for details.';
               }
               await el.fill((answer || '').slice(0, 500));
-              log('  ✓ Text input: ' + rawLabel.slice(0, 50));
             }
           }
         }
@@ -684,15 +672,10 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
       const eeocLabels = await page.$$('label');
       for (const lbl of eeocLabels) {
         const lblText = (await lbl.textContent().catch(() => '')).toLowerCase().trim();
-        if (!lblText) continue;
-        if (!/gender|race|ethnic|sexual orient|disability|veteran|lgbtq|pronoun|transgender/.test(lblText)) continue;
+        if (!lblText || !/gender|race|ethnic|sexual orient|disability|veteran|lgbtq|pronoun|transgender/.test(lblText)) continue;
         const forAttr = await lbl.getAttribute('for');
         if (!forAttr) continue;
-        const container = await lbl.evaluateHandle(el => {
-          let p = el.parentElement;
-          for (let i = 0; i < 5; i++) { if (!p) break; if (p.children.length > 1) return p; p = p.parentElement; }
-          return el.parentElement;
-        });
+        const container = await lbl.evaluateHandle(el => { let p = el.parentElement; for (let i = 0; i < 5; i++) { if (!p) break; if (p.children.length > 1) return p; p = p.parentElement; } return el.parentElement; });
         const trigger = await container.$('[class*="css-"][class*="control"], [class*="css-"][class*="container"], [role="combobox"]').catch(() => null);
         if (trigger && await trigger.isVisible().catch(() => false)) {
           await trigger.click({ timeout: 2000, force: true }); await page.waitForTimeout(600);
@@ -701,35 +684,28 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
           for (const opt of options) {
             const t = (await opt.innerText().catch(() => '')).toLowerCase();
             if (t.includes('decline') || t.includes('not wish') || t.includes('prefer not') || t.includes('choose not') || t.includes('do not have') || t.includes('not a protected')) {
-              await opt.click({ timeout: 1500 }); log('  ✓ EEOC label dropdown: ' + lblText.slice(0, 30)); picked = true; break;
+              await opt.click({ timeout: 1500 }); picked = true; break;
             }
           }
-          if (!picked && options.length > 0) {
-            const lastOpt = options[options.length - 1];
-            const lastText = (await lastOpt.innerText().catch(() => '')).trim();
-            if (lastText && !lastText.toLowerCase().includes('select')) { await lastOpt.click({ timeout: 1500 }); log('  ✓ EEOC label dropdown (last): ' + lastText.slice(0, 30)); }
-          }
+          if (!picked && options.length > 0) { await options[options.length - 1].click({ timeout: 1500 }).catch(() => {}); }
           await page.waitForTimeout(300);
         }
       }
-    } catch(e) { log('  ⚠ EEOC label handler: ' + e.message.slice(0, 50)); }
+    } catch(e) {}
 
     for (const eeocField of ['gender','hispanic_ethnicity','veteran_status','disability_status']) {
       try {
         const el = await page.$(`[id="${eeocField}"]`);
         if (!el) continue;
         const tag = await el.evaluate(e => e.tagName.toLowerCase());
-        if (tag === 'select') { await el.selectOption({ index: 1 }).catch(() => {}); log('  ✓ EEOC select: ' + eeocField); }
+        if (tag === 'select') { await el.selectOption({ index: 1 }).catch(() => {}); }
         else {
           await el.click().catch(() => {}); await page.waitForTimeout(400);
           const options = await page.$$('[role="option"], ul li, [class*="option"]');
           for (const opt of options) {
             const t = (await opt.innerText().catch(() => '')).toLowerCase();
-            if (t.includes('decline') || t.includes('not wish') || t.includes('prefer not') || t.includes('choose not') || t.includes('not a protected') || t.includes('do not have a disability') || t.includes('i am not')) {
-              await opt.click(); log('  ✓ EEOC decline: ' + eeocField); break;
-            }
+            if (t.includes('decline') || t.includes('not wish') || t.includes('prefer not') || t.includes('not a protected') || t.includes('do not have')) { await opt.click(); break; }
           }
-          if (options.length > 0) await options[0].click().catch(() => {});
           await page.waitForTimeout(300);
         }
       } catch(e) {}
@@ -739,18 +715,12 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
       const allLabels = await page.$$('label');
       for (const label of allLabels) {
         const text = (await label.innerText() || '').toLowerCase();
-        if (text.includes('decline to self-identify') || text.includes('i do not wish to answer') || text.includes('prefer not to say') || text.includes('decline to identify') || text.includes('i do not wish to disclose')) {
-          await label.click();
-        }
+        if (text.includes('decline to self-identify') || text.includes('i do not wish to answer') || text.includes('prefer not to say') || text.includes('decline to identify')) await label.click();
       }
     } catch(e) {}
 
     const submitBtn = page.locator('#submit_app, input[type="submit"][value*="Submit" i], button[type="submit"]').first();
-    if (await submitBtn.count() === 0) {
-      const html = await page.content();
-      fs.writeFileSync(`/tmp/debug-greenhouse-${Date.now()}.html`, html.slice(0, 50000));
-      return { success: false, message: 'Submit button not found' };
-    }
+    if (await submitBtn.count() === 0) return { success: false, message: 'Submit button not found' };
 
     const successPromise = Promise.any([
       page.waitForRequest(req => req.url().includes(`/v1/boards/${slug}/jobs/${jobId}/application`) && req.method() === 'POST', { timeout: 15000 }),
@@ -759,36 +729,32 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
 
     await submitBtn.scrollIntoViewIfNeeded();
     await page.waitForTimeout(Math.floor(Math.random() * 1000 + 500));
-    await submitBtn.hover();
-    await page.waitForTimeout(Math.floor(Math.random() * 400 + 200));
+    await humanizedClick(page, await submitBtn.elementHandle());
     log(`  🖱 Submitting...`);
-    await submitBtn.click({ delay: Math.floor(Math.random() * 150 + 50) });
 
     const result = await successPromise;
     const afterUrl = page.url();
     const pageText = await page.textContent('body').catch(() => '');
 
-    if (pageText.match(/already applied|already submitted|previously applied/i)) return { duplicate: true, message: 'Already applied to this role' };
+    if (pageText.match(/already applied|already submitted|previously applied/i)) return { duplicate: true, message: 'Already applied' };
     if (result) {
       const resultUrl = typeof result.url === 'function' ? result.url() : afterUrl;
-      if (resultUrl.includes('confirmation')) return { success: true, message: `Submitted via Greenhouse ✓ (confirmed)` };
-      return { success: true, message: `Submitted via Greenhouse ✓ (POST intercepted)` };
+      return { success: true, message: resultUrl.includes('confirmation') ? 'Submitted via Greenhouse ✓ (confirmed)' : 'Submitted via Greenhouse ✓ (POST intercepted)' };
     }
-    if (pageText.match(/thank you|application received|submitted|we received/i)) return { success: true, message: 'Submitted via Greenhouse ✓ (DOM)' };
-    if (afterUrl.includes('confirmation')) return { success: true, message: `Submitted via Greenhouse ✓ (URL)` };
+    if (pageText.match(/thank you|application received|we received/i)) return { success: true, message: 'Submitted via Greenhouse ✓ (DOM)' };
+    if (afterUrl.includes('confirmation')) return { success: true, message: 'Submitted via Greenhouse ✓ (URL)' };
 
     try {
       const securityInput = page.locator('input[id*="verification"], input[id*="security"], input[name*="code"], input[placeholder*="code" i]');
       if (await securityInput.count() > 0 && await securityInput.isVisible().catch(() => false)) {
-        log('  🔒 Security code gate detected — polling Gmail...');
+        log('  🔒 Security code gate — polling Gmail...');
         const code = await pollForSecurityCode();
         if (code) {
           await securityInput.fill(code); await page.waitForTimeout(500);
           const resubmitBtn = page.locator('button[type="submit"], input[type="submit"]').first();
           if (await resubmitBtn.count() > 0) await resubmitBtn.click();
           await page.waitForTimeout(3000);
-          log('  🔑 Security code submitted: ' + code);
-        } else { log('  ⚠ No security code found in Gmail within 45s'); }
+        }
       }
     } catch(se) {}
 
@@ -798,18 +764,10 @@ async function submitGreenhouse(page, job, resumeText, resumePdfUrl, focus) {
     }).catch(() => []);
     if (validationErrors.length > 0) {
       log(`  📋 Validation errors: ${validationErrors.join(' | ')}`);
-      const isCustomQuestionFailure = validationErrors.some(e => e.match(/why do you|tell us|describe|what is your|how did you hear|willing to|authorized|currently located/i));
-      if (isCustomQuestionFailure) {
-        const missingQs = validationErrors.filter(e => e.match(/why do you|tell us|describe|what is your/i)).join(' | ');
-        return { success: false, needs_custom: true, message: `Needs custom answers: ${missingQs.slice(0, 200)}` };
-      }
       return { success: false, message: `Validation: ${validationErrors.slice(0, 3).join(', ')}` };
     }
-    if (pageText.match(/error|required|invalid|can.t be blank/i)) return { success: false, message: `Validation error` };
 
     await page.screenshot({ path: '/tmp/greenhouse-debug.png', fullPage: true }).catch(() => {});
-    const html = await page.content();
-    fs.writeFileSync(`/tmp/debug-greenhouse-${Date.now()}.html`, html.slice(0, 50000));
     return { success: false, message: `No confirmation at ${afterUrl}` };
   } catch (err) {
     return { success: false, message: `Greenhouse error: ${err.message}` };
@@ -828,25 +786,14 @@ async function submitLever(page, job, resumeText, resumePdfUrl, focus) {
     if (!finalDomain.includes('lever.co')) return { success: false, manual: true, message: `Custom site: ${finalDomain}` };
 
     if (resumePdfUrl) {
-      await uploadResumePdf(page, resumePdfUrl, ['input[type="file"][id="resume_file"]', 'input[type="file"]']);
+      await uploadResumePdf(page, resumePdfUrl, ['input[type="file"][id="resume_file"]','input[type="file"]']);
       log(`  📎 Resume uploaded — waiting for parse...`);
-
-      // ── FIXED: bounded parse wait — prevents infinite hang on slow/stuck Lever parser ──
       try {
         await Promise.race([
-          page.waitForFunction(() => {
-            const nameInput = document.querySelector('input[name="name"]');
-            return nameInput && nameInput.value && nameInput.value.length > 1;
-          }, { timeout: 12000 }),
-          new Promise(resolve => setTimeout(() => {
-            log('  ⚠ Resume parse timeout — moving forward');
-            resolve();
-          }, 12000)),
+          page.waitForFunction(() => { const n = document.querySelector('input[name="name"]'); return n && n.value && n.value.length > 1; }, { timeout: 12000 }),
+          new Promise(resolve => setTimeout(() => { log('  ⚠ Resume parse timeout — moving forward'); resolve(); }, 12000)),
         ]);
-      } catch(e) {
-        log('  ⚠ Resume parse wait: ' + e.message.slice(0, 40));
-      }
-      // ─────────────────────────────────────────────────────────────────────────────────────
+      } catch(e) { log('  ⚠ Resume parse wait: ' + e.message.slice(0, 40)); }
     }
 
     const nameFilled = await clearAndType(page, 'input[name="name"]', PROFILE.full_name);
@@ -857,9 +804,6 @@ async function submitLever(page, job, resumeText, resumePdfUrl, focus) {
     await clearAndType(page, 'input[name="urls[LinkedIn]"]', PROFILE.linkedin);
     await clearAndType(page, 'input[name="org"]', 'Stealth Startup').catch(() => {});
     await clearAndType(page, 'input[name="location"]', 'San Mateo, CA').catch(() => {});
-
-    const exportField = await page.$('input[name*="export"], textarea[name*="export"], input[placeholder*="export" i], input[placeholder*="citizenship" i]').catch(() => null);
-    if (exportField) await clearAndType(page, 'input[name*="export"], textarea[name*="export"]', 'United States citizen').catch(() => {});
 
     const questionBlocks = await page.$$('.application-question, [data-qa="additional-cards"] .card, .cards-app-item');
     for (const block of questionBlocks) {
@@ -872,7 +816,6 @@ async function submitLever(page, job, resumeText, resumePdfUrl, focus) {
             const noOpt = await page.$('[role="option"]:has-text("No")');
             if (noOpt) await noOpt.click().catch(() => {});
           });
-          log('  ✓ Lever sponsorship: No');
         }
         const noRadio = await block.$('input[value="No"], label:has-text("No")');
         if (noRadio) await noRadio.click().catch(() => {});
@@ -884,37 +827,26 @@ async function submitLever(page, job, resumeText, resumePdfUrl, focus) {
             await sel.click().catch(() => {}); await new Promise(r => setTimeout(r, 400));
             const opt = await page.$('[role="option"]:has-text("LinkedIn")');
             if (opt) await opt.click().catch(() => {});
-            else { const otherOpt = await page.$('[role="option"]:has-text("Other")'); if (otherOpt) await otherOpt.click().catch(() => {}); }
+            else { const other = await page.$('[role="option"]:has-text("Other")'); if (other) await other.click().catch(() => {}); }
           });
-          log('  ✓ Lever hear about us: LinkedIn');
         }
       }
       if (/authorized.*work|work.*authorized|eligible.*work/.test(blockText)) {
-        const yesOpt = await block.$('input[value="Yes"], label:has-text("Yes")');
-        if (yesOpt) await yesOpt.click().catch(() => {});
+        const yes = await block.$('input[value="Yes"], label:has-text("Yes")');
+        if (yes) await yes.click().catch(() => {});
       }
       if (/pronoun/.test(blockText)) {
-        const heOpt = await block.$('label:has-text("He/him"), input[value*="he"]');
-        if (heOpt) await heOpt.click().catch(() => {});
+        const he = await block.$('label:has-text("He/him"), input[value*="he"]');
+        if (he) await he.click().catch(() => {});
       }
-      if (/export.*control|export.*licens|citizen.*country|countries.*citizen/.test(blockText)) {
-        const textInput = await block.$('input[type="text"], textarea');
-        if (textInput) { await textInput.click().catch(() => {}); await textInput.type('United States citizen', { delay: 20 }).catch(() => {}); log('  ✓ Lever export control filled'); }
+      if (/export.*control|citizen.*country/.test(blockText)) {
+        const ti = await block.$('input[type="text"], textarea');
+        if (ti) { await ti.click().catch(() => {}); await ti.type('United States citizen', { delay: 50 + Math.floor(Math.random() * 50) }).catch(() => {}); }
       }
       if (/preferred.*name|preferred first/.test(blockText)) {
-        const textInput = await block.$('input[type="text"]');
-        if (textInput && await textInput.isVisible().catch(() => false)) {
-          const val = await textInput.inputValue().catch(() => '');
-          if (!val) await textInput.type(PROFILE.first_name, { delay: 20 }).catch(() => {});
-        }
+        const ti = await block.$('input[type="text"]');
+        if (ti && await ti.isVisible().catch(() => false)) { const v = await ti.inputValue().catch(() => ''); if (!v) await ti.type(PROFILE.first_name, { delay: 50 }).catch(() => {}); }
       }
-    }
-
-    for (const [label, value] of [['Gender', 'Decline to self-identify'],['Race', 'Decline to self-identify'],['Veteran status', 'Decline to self-identify']]) {
-      try {
-        const sel = await page.$(`select:near(:text("${label}"))`).catch(() => null);
-        if (sel) await sel.selectOption({ label: value }).catch(() => {});
-      } catch(e) {}
     }
 
     const answers = job.generated_responses || {};
@@ -933,12 +865,11 @@ async function submitLever(page, job, resumeText, resumePdfUrl, focus) {
     if (captcha) { log('  ⚠ CAPTCHA detected'); return { success: false, manual: true, message: 'CAPTCHA wall detected' }; }
 
     let leverSubmitted = false;
-    for (const sel of ['button[data-qa="btn-submit"]', '.lever-button-black[type="submit"]', 'button[type="submit"]', 'input[type="submit"]', 'button:has-text("Submit Application")', 'button:has-text("Apply")']) {
+    for (const sel of ['button[data-qa="btn-submit"]','.lever-button-black[type="submit"]','button[type="submit"]','input[type="submit"]','button:has-text("Submit Application")','button:has-text("Apply")']) {
       const btn = await page.$(sel);
       if (btn && await btn.isVisible().catch(() => false)) {
-        await btn.scrollIntoViewIfNeeded(); await btn.hover();
-        await page.waitForTimeout(Math.floor(Math.random() * 300 + 100));
-        await btn.click({ delay: Math.floor(Math.random() * 100 + 50) });
+        await btn.scrollIntoViewIfNeeded();
+        await humanizedClick(page, btn);
         log(`  🖱 Lever submit clicked: ${sel}`); leverSubmitted = true; break;
       }
     }
@@ -949,7 +880,7 @@ async function submitLever(page, job, resumeText, resumePdfUrl, focus) {
     const leverText = await page.textContent('body').catch(() => '');
     log(`  📍 ${leverUrl}`);
 
-    if (leverResult || leverUrl.includes('/thanks')) return { success: true, message: `Submitted via Lever ✓` };
+    if (leverResult || leverUrl.includes('/thanks')) return { success: true, message: 'Submitted via Lever ✓' };
     if (leverText.match(/application submitted!|your application has been received|thank you for applying/i)) return { success: true, message: 'Submitted via Lever ✓ (DOM)' };
 
     await page.screenshot({ path: '/tmp/lever-debug.png', fullPage: true }).catch(() => {});
@@ -972,7 +903,7 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
 
     log('  📝 Filling Ashby form fields...');
 
-    const ESSAY_ANSWER = "I am most proud of building Promotable from scratch to $40k/month in revenue, selecting it as an education partner with 1871 Chicago's top tech incubator. I identified a gap in data skills training, built an automated omnichannel sales funnel, converted a B2C audience to enterprise clients including McDonald's and City Colleges of Chicago. This required building operations, sales, and marketing systems from zero while staying capital efficient.";
+    const ESSAY_ANSWER = "I am most proud of building Promotable from scratch to $40k/month in revenue, selected as an education partner by 1871 Chicago's top tech incubator. I identified a gap in data skills training, built an automated omnichannel sales funnel, and converted a B2C audience to enterprise clients including McDonald's and City Colleges of Chicago.";
 
     try {
       const formInputs = await page.$$('input, textarea, [contenteditable="true"]');
@@ -990,74 +921,63 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
           if (inputId === '_systemfield_phone' || inputName === '_systemfield_phone') {
             await input.focus(); await input.click({ clickCount: 3 });
             await page.keyboard.type(PROFILE.phone_formatted, { delay: 40 });
-            const phoneVal = await input.evaluate(el => el.value).catch(() => '');
-            if (!phoneVal) { await input.fill(PROFILE.phone_formatted); await input.evaluate(e => { e.dispatchEvent(new Event('input', { bubbles: true })); e.dispatchEvent(new Event('change', { bubbles: true })); }); }
-            log('  ✓ Filled system phone field: ' + (await input.evaluate(el => el.value).catch(() => '?'))); continue;
+            const v = await input.evaluate(el => el.value).catch(() => '');
+            if (!v) { await input.fill(PROFILE.phone_formatted); await input.evaluate(e => { e.dispatchEvent(new Event('input',{bubbles:true})); e.dispatchEvent(new Event('change',{bubbles:true})); }); }
+            log('  ✓ System phone: ' + (await input.evaluate(el => el.value).catch(() => '?'))); continue;
           }
           if (inputId === '_systemfield_linkedin' || inputName === '_systemfield_linkedin') {
             await input.focus(); await input.click({ clickCount: 3 });
             await page.keyboard.type(PROFILE.linkedin, { delay: 40 });
-            const liVal = await input.evaluate(el => el.value).catch(() => '');
-            if (!liVal) { await input.fill(PROFILE.linkedin); await input.evaluate(e => { e.dispatchEvent(new Event('input', { bubbles: true })); e.dispatchEvent(new Event('change', { bubbles: true })); }); }
-            log('  ✓ Filled system LinkedIn field'); continue;
+            const v = await input.evaluate(el => el.value).catch(() => '');
+            if (!v) { await input.fill(PROFILE.linkedin); await input.evaluate(e => { e.dispatchEvent(new Event('input',{bubbles:true})); e.dispatchEvent(new Event('change',{bubbles:true})); }); }
+            log('  ✓ System LinkedIn'); continue;
           }
 
           const isHoneypot = await input.evaluate(el => {
-            const rect = el.getBoundingClientRect();
-            if (rect.width === 0 || rect.height === 0) return true;
-            if (rect.width < 5 || rect.height < 5) return true;
-            const style = window.getComputedStyle(el);
-            if (style.opacity === '0' || style.display === 'none' || style.visibility === 'hidden') return true;
-            return false;
+            const r = el.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0 || r.width < 5 || r.height < 5) return true;
+            const s = window.getComputedStyle(el);
+            return s.opacity === '0' || s.display === 'none' || s.visibility === 'hidden';
           }).catch(() => false);
-          if (isHoneypot) { log('  ⚠ Honeypot skipped'); continue; }
+          if (isHoneypot) continue;
 
           const meta = await input.evaluate(el => {
-            const parent = el.closest('[class*="field"], [class*="form"], label, li, div') || el.parentElement;
+            const parent = el.closest('[class*="field"],[class*="form"],label,li,div') || el.parentElement;
             const labelEl = document.querySelector(`label[for="${el.id}"]`);
-            return [el.getAttribute('placeholder')||'', el.getAttribute('aria-label')||'', el.getAttribute('name')||'', el.getAttribute('id')||'', labelEl?.innerText||'', parent?.innerText?.slice(0,100)||''].join(' ').toLowerCase();
+            return [el.getAttribute('placeholder')||'',el.getAttribute('aria-label')||'',el.getAttribute('name')||'',el.getAttribute('id')||'',labelEl?.innerText||'',parent?.innerText?.slice(0,100)||''].join(' ').toLowerCase();
           }).catch(() => '');
 
           const currentVal = await input.evaluate(el => el.value || '').catch(() => '');
           let fillVal = null;
 
           if (/\bfull.?name\b/.test(meta) || (/\bname\b/.test(meta) && !meta.includes('company') && !meta.includes('employer') && !meta.includes('file') && !meta.includes('school') && !meta.includes('hear') && meta.length < 200)) {
-            if (meta.includes('first')) fillVal = PROFILE.first_name;
-            else if (meta.includes('last')) fillVal = PROFILE.last_name;
-            else fillVal = PROFILE.full_name;
+            fillVal = meta.includes('first') ? PROFILE.first_name : meta.includes('last') ? PROFILE.last_name : PROFILE.full_name;
           }
           else if (/\bemail\b/.test(meta) && meta.length < 200) fillVal = PROFILE.email;
           else if (/\bphone\b|\btel\b|phone number/.test(meta) && meta.length < 200) fillVal = PROFILE.phone_formatted;
-          else if (/linkedin|linkedin profile/.test(meta)) { const li = PROFILE.linkedin || ''; fillVal = li.startsWith('http') ? li : 'https://' + li.replace(/^\/\//, ''); }
-          else if (/\bwebsite\b|\bportfolio\b/.test(meta)) fillVal = PROFILE.linkedin;
+          else if (/linkedin/.test(meta)) { const li = PROFILE.linkedin; fillVal = li.startsWith('http') ? li : 'https://' + li; }
+          else if (/\bwebsite\b|\bportfolio\b/.test(meta)) fillVal = PROFILE.website;
           else if (/how did you hear|where did you hear|referral source/.test(meta)) fillVal = 'LinkedIn';
-          else if (/country.*reside|country.*currently|currently.*reside|reside.*country/.test(meta)) fillVal = 'United States';
+          else if (/country.*reside|country.*currently|currently.*reside/.test(meta)) fillVal = 'United States';
           else if (/country/.test(meta) && meta.length < 100) fillVal = 'United States';
-          else if (/require.*sponsor|sponsor.*work|visa.*sponsor|need.*sponsor/.test(meta)) fillVal = 'No';
-          else if (/legal.*permanent.*resid|permanent.*resid.*countries|hold.*permanent.*resid/.test(meta)) fillVal = 'United States';
+          else if (/require.*sponsor|sponsor.*work|visa.*sponsor/.test(meta)) fillVal = 'No';
+          else if (/legal.*permanent.*resid|permanent.*resid.*countries/.test(meta)) fillVal = 'United States';
           else if (/your pronouns|pronouns/.test(meta)) fillVal = 'He/Him';
           else if (/legal.*first.*last|legal.*name|full.*legal/.test(meta)) fillVal = PROFILE.full_name;
           else if (/preferred.*first|first.*preferred/.test(meta)) fillVal = PROFILE.first_name;
           else if (/preferred.*last|last.*preferred/.test(meta)) fillVal = PROFILE.last_name;
-          else if (/current.*employer|most recent.*employer|university.*school|school.*attended/.test(meta)) fillVal = 'Stealth Startup';
+          else if (/current.*employer|most recent.*employer/.test(meta)) fillVal = 'Stealth Startup';
           else if (/location/.test(meta) && meta.length < 80) fillVal = 'San Mateo, CA';
-          else if (/years.*experience.*qualify|fall.*within.*qualifying|qualifying.*range/.test(meta)) fillVal = 'Yes';
-          else if (/current.*company|most recent.*company|recent employer/.test(meta)) fillVal = 'Stealth Startup';
+          else if (/current.*company|most recent.*company/.test(meta)) fillVal = 'Stealth Startup';
           else if (/proud of|exceptional performance|something you/.test(meta)) fillVal = ESSAY_ANSWER;
-          else if (/why harper|why.*specifically|what attracted you|what about.*mission|what.*pulls you/.test(meta)) fillVal = 'I am drawn to Harper because rebuilding a broken industry with AI from first principles is exactly the kind of high-stakes zero-to-one challenge I thrive in. My background building Promotable to $40k/month and leading a $200M portfolio consolidation at Enova has prepared me for messy zero-to-one problems.';
-          else if (/what excites you|why.*want.*work|why do you want|why.*company|why.*role|why.*position|why.*join|why.*interest|most excit|drawn to|why baseten|why elevenlabs|why watershed|why cognition|why harvey/.test(meta)) fillVal = 'I am excited by the opportunity to apply my 10+ years of strategy and operations experience at a company building at the frontier. At Enova International I led a $200M portfolio consolidation and drove 200% increase in SDR productivity. I founded Promotable which grew to $40k/month revenue.';
-          else if (/messy.*ambiguous|ambiguous.*thing|personally owned.*drove|mess.*what did you|hardest part/.test(meta)) fillVal = 'At Enova I was handed a vague directive to wind down a $200M business unit with no playbook. I scoped the full initiative myself, identified every cross-functional dependency across legal, compliance, product, finance and customer success, built the project plan, and drove it to completion.';
-          else if (/beyond your title|went beyond|no one asked|took on that|rotates you across|real work/.test(meta)) fillVal = 'At App Academy I was hired as a Business Operations Manager but ended up managing state regulatory relationships, running the financial audit conversion to GAAP, and building the entire CS team from scratch — none of which was in my job description.';
-          else if (/program.*end.to.end|execute.*program|responsible for.*program|program you.*own/.test(meta)) fillVal = 'At Enova International I led a major cross-functional initiative to close and consolidate a business unit with a $200M loan portfolio. I owned the program end-to-end: scoping with the COO, building the project plan, coordinating across legal, compliance, finance, product, and customer success.';
-          else if (/measure success|metrics.*mattered|how did you measure|signals.*metrics|results.*change/.test(meta)) fillVal = 'I tracked leading indicators alongside outcomes. For the Enova consolidation I monitored milestone completion rate, stakeholder alignment, and risk items resolved per sprint. Post-completion I measured cost reduction vs. target, compliance audit pass rate, and team retention through transition.';
-          else if (/technical audience|platform team|technical leader|developer audience|adapt.*messaging|marketed.*technical/.test(meta)) fillVal = 'At Kixie I worked directly with engineering and product leaders to implement new GTM processes and CRM infrastructure. I adapted by leading with data and system logic, using technical terminology accurately, and presenting tradeoffs in terms of implementation complexity.';
-          else if (/anything else|additional.*support|additional information|other.*information/.test(meta)) fillVal = 'Please see my attached resume for additional details on my background and qualifications.';
-          else if (/notice period|earliest.*start|how soon|when.*available|start date/.test(meta)) fillVal = 'Immediately';
-          else if (/previously.*employed|worked.*here.*before|former.*employee/.test(meta)) fillVal = 'No';
-          else if (/vague idea|from scratch|ambiguity|build story|move.*project/.test(meta)) fillVal = 'I rapidly map cross-functional dependencies, build lean trackers and automations, and establish documentation that serves as a source of truth.';
-          else if (/fast-paced|high-growth|maintain visibility|priorities.*competing|stay organized.*multiple/.test(meta)) fillVal = 'I use a combination of a weekly priorities doc, a cross-functional dependency tracker, and structured stakeholder check-ins.';
-          else if (/which best describes.*environment|types of environments|career.*environment/.test(meta)) fillVal = 'Early-stage startup or high-growth environment';
-          else if (/why.*startup|why.*early.stage|why.*fast.paced|why.*high.growth/.test(meta)) fillVal = 'I thrive in high-growth environments where impact is immediate and cross-functional agility is required.';
+          else if (/what excites you|why.*want.*work|why do you want|why.*company|why.*role|why.*join|why.*interest|most excit|drawn to/.test(meta)) fillVal = 'I am excited by the opportunity to apply my 10+ years of strategy and operations experience. At Enova International I led a $200M portfolio consolidation and drove 200% increase in SDR productivity. I founded Promotable which grew to $40k/month revenue.';
+          else if (/messy.*ambiguous|ambiguous.*thing|hardest part/.test(meta)) fillVal = 'At Enova I was handed a vague directive to wind down a $200M business unit with no playbook. I scoped the full initiative, identified every cross-functional dependency, built the project plan, and drove it to completion on time.';
+          else if (/beyond your title|went beyond|no one asked/.test(meta)) fillVal = 'At App Academy I was hired as Business Operations Manager but ended up managing state regulatory relationships, running the financial audit conversion to GAAP, and building the CS team from scratch.';
+          else if (/program.*end.to.end|execute.*program|program you.*own/.test(meta)) fillVal = 'At Enova I led a cross-functional program to close a $200M loan portfolio end-to-end: scoping with the COO, building the project plan, coordinating across legal, compliance, finance, product, and customer success.';
+          else if (/measure success|metrics.*mattered|how did you measure/.test(meta)) fillVal = 'I track leading indicators alongside outcomes — milestone completion, stakeholder alignment, risk items resolved. Post-completion I measure cost reduction vs target, compliance audit pass rate, and team retention.';
+          else if (/anything else|additional information|other.*information/.test(meta)) fillVal = 'Please see my attached resume for additional details.';
+          else if (/notice period|earliest.*start|when.*available|start date/.test(meta)) fillVal = 'Immediately';
+          else if (/previously.*employed|former.*employee/.test(meta)) fillVal = 'No';
           else if (/salary|compensation/.test(meta)) fillVal = '145000';
 
           if (fillVal && fillVal !== currentVal) {
@@ -1092,31 +1012,30 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
 
     // Phone sweep
     try {
-      const phoneSelectors = ['input[name="_systemfield_phone"]','input[id="_systemfield_phone"]','input[type="tel"]','input[placeholder*="phone" i]','input[placeholder*="Phone" i]','input[aria-label*="phone" i]','input[autocomplete="tel"]'];
+      const phoneSelectors = ['input[name="_systemfield_phone"]','input[id="_systemfield_phone"]','input[type="tel"]','input[placeholder*="phone" i]','input[aria-label*="phone" i]','input[autocomplete="tel"]'];
       let phoneFilled = false;
       for (const sel of phoneSelectors) {
-        const phoneInput = await page.$(sel).catch(() => null);
-        if (!phoneInput || !await phoneInput.isVisible().catch(() => false)) continue;
-        const existing = await phoneInput.evaluate(el => el.value).catch(() => '');
-        if (existing && existing.length > 5) { log('  ✓ Phone already filled: ' + existing); phoneFilled = true; break; }
-        await phoneInput.focus(); await phoneInput.click({ clickCount: 3 });
+        const pi = await page.$(sel).catch(() => null);
+        if (!pi || !await pi.isVisible().catch(() => false)) continue;
+        const existing = await pi.evaluate(el => el.value).catch(() => '');
+        if (existing && existing.length > 5) { phoneFilled = true; break; }
+        await pi.focus(); await pi.click({ clickCount: 3 });
         await page.keyboard.type(PROFILE.phone_formatted, { delay: 40 });
-        const val = await phoneInput.evaluate(el => el.value).catch(() => '');
-        if (!val) { await phoneInput.fill(PROFILE.phone_formatted); await phoneInput.evaluate(e => { e.dispatchEvent(new Event('input', { bubbles: true })); e.dispatchEvent(new Event('change', { bubbles: true })); }); }
-        log('  ✓ Phone sweep filled: ' + (await phoneInput.evaluate(el => el.value).catch(() => '?')) + ' via ' + sel);
+        const val = await pi.evaluate(el => el.value).catch(() => '');
+        if (!val) { await pi.fill(PROFILE.phone_formatted); await pi.evaluate(e => { e.dispatchEvent(new Event('input',{bubbles:true})); e.dispatchEvent(new Event('change',{bubbles:true})); }); }
+        log('  ✓ Phone sweep: ' + (await pi.evaluate(el => el.value).catch(() => '?')));
         phoneFilled = true; break;
       }
       if (!phoneFilled) log('  ⚠ Phone field not found by sweep');
-    } catch(e) { log('  ⚠ Phone sweep error: ' + e.message.slice(0, 50)); }
+    } catch(e) {}
 
     // Location
     try {
       const locInput = await page.$('input[placeholder*="Location" i], input[aria-label*="location" i], input[placeholder*="City" i]');
       if (locInput && await locInput.isVisible().catch(() => false)) {
         await locInput.click(); await locInput.type('San Mateo, CA', { delay: 50 }); await page.waitForTimeout(1000);
-        const opt = await page.$('[role="option"], [class*="option"]');
+        const opt = await page.$('[role="option"]');
         if (opt) await opt.click(); else { await page.keyboard.press('ArrowDown'); await page.keyboard.press('Enter'); }
-        log('  ✓ Ashby location filled');
       }
     } catch(e) {}
 
@@ -1125,13 +1044,28 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
       const checkboxes = await page.$$('input[type="checkbox"]');
       for (const cb of checkboxes) {
         if (await cb.isChecked().catch(() => true)) continue;
-        const label = await cb.evaluate(el => { const lbl = document.querySelector(`label[for="${el.id}"]`); return (lbl?.innerText || el.closest('label')?.innerText || '').toLowerCase(); }).catch(() => '');
+        const label = await cb.evaluate(el => { const l = document.querySelector(`label[for="${el.id}"]`); return (l?.innerText || el.closest('label')?.innerText || '').toLowerCase(); }).catch(() => '');
         if (/sms|text message|marketing|promotional/.test(label)) continue;
-        if (/confidential|privacy policy|terms|acknowledge|agree|certify|consent/.test(label) || label === '') { await cb.evaluate(el => el.click()); log('  ✓ Checked: ' + label.slice(0, 40)); }
+        if (/confidential|privacy policy|terms|acknowledge|agree|certify|consent/.test(label) || label === '') { await cb.evaluate(el => el.click()); }
       }
     } catch(e) {}
 
-    if (resumePdfUrl) await uploadResumePdf(page, resumePdfUrl, ['input[type="file"]']);
+    // Resume upload with change event dispatch for React state
+    if (resumePdfUrl) {
+      const tmpPath = '/tmp/aaron_resume.pdf';
+      await uploadResumePdf(page, resumePdfUrl, ['input[type="file"]']);
+      // Fire change event after upload so React registers the file
+      try {
+        const fileInput = await page.$('input[type="file"]');
+        if (fileInput) {
+          await fileInput.evaluate(el => {
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+          });
+          log('  📎 File change event dispatched');
+        }
+      } catch(e) {}
+    }
 
     const answers = job.generated_responses || {};
     for (const [question, answer] of Object.entries(answers)) await tryFillByLabel(page, question, String(answer));
@@ -1153,120 +1087,113 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
       const allCombos = await page.$$('[role="combobox"]');
       for (const cb of allCombos) {
         if (!await cb.isVisible().catch(() => false)) continue;
-        const parentText = await cb.evaluate(el => { let p = el.parentElement; for (let i = 0; i < 5; i++) { if (!p) break; if (p.innerText?.length > 5) return p.innerText.toLowerCase(); p = p.parentElement; } return ''; }).catch(() => '');
-        if (/how did you hear|where did you hear|referral|source/.test(parentText)) {
+        const pt = await cb.evaluate(el => { let p = el.parentElement; for (let i=0;i<5;i++){if(!p)break;if(p.innerText?.length>5)return p.innerText.toLowerCase();p=p.parentElement;}return ''; }).catch(() => '');
+        if (/how did you hear|where did you hear|referral|source/.test(pt)) {
           await cb.click().catch(() => {}); await new Promise(r => setTimeout(r, 500));
           const opts = await page.$$('[role="option"]');
           for (const opt of opts) {
             const t = (await opt.innerText().catch(() => '')).toLowerCase();
-            if (t.includes('linkedin') || t.includes('other') || t.includes('job board') || t.includes('online')) { await opt.click().catch(() => {}); log('  ✓ Hear about us: ' + t.slice(0, 25)); break; }
+            if (t.includes('linkedin') || t.includes('other') || t.includes('job board')) { await opt.click().catch(() => {}); break; }
           }
         }
       }
     } catch(e) {}
 
-    try {
-      const ashbyCaptcha = await page.$('#h-captcha, .h-captcha, iframe[src*="hcaptcha"]').catch(() => null);
-      if (ashbyCaptcha) { log('  ⚠ CAPTCHA detected'); return { success: false, manual: true, message: 'CAPTCHA wall detected' }; }
-    } catch(e) {}
+    const ashbyCaptcha = await page.$('#h-captcha, .h-captcha, iframe[src*="hcaptcha"]').catch(() => null);
+    if (ashbyCaptcha) { log('  ⚠ CAPTCHA detected'); return { success: false, manual: true, message: 'CAPTCHA wall detected' }; }
 
-    // Pre-submit sweep
+    // Pre-submit: auto-select empty dropdowns
     try {
       const allSelects = await page.$$('select');
-      for (const sel of allSelects) {
-        const val = await sel.evaluate(el => el.value).catch(() => '');
-        if (!val) { await sel.selectOption({ index: 1 }).catch(() => {}); log('  ✓ Auto-selected empty dropdown'); }
-      }
+      for (const sel of allSelects) { const v = await sel.evaluate(el => el.value).catch(() => ''); if (!v) await sel.selectOption({ index: 1 }).catch(() => {}); }
     } catch(e) {}
 
+    // Pre-submit: radio groups
     try {
-      const radioGroups = await page.$$('[role="radiogroup"], [class*="radioGroup" i], [class*="radio-group" i]');
+      const radioGroups = await page.$$('[role="radiogroup"], [class*="radioGroup" i]');
       for (const group of radioGroups) {
         const checked = await group.$('[aria-checked="true"], input:checked');
         if (checked) continue;
-        const groupText = await group.evaluate(el => { let p = el.parentElement; for (let i = 0; i < 4; i++) { if (!p) break; if (p.innerText?.length > 10) return p.innerText.toLowerCase(); p = p.parentElement; } return ''; }).catch(() => '');
-        const pickNo = /sponsor|visa.*require|require.*visa/.test(groupText);
-        const targetText = pickNo ? 'no' : 'yes';
+        const gt = await group.evaluate(el => { let p=el.parentElement;for(let i=0;i<4;i++){if(!p)break;if(p.innerText?.length>10)return p.innerText.toLowerCase();p=p.parentElement;}return ''; }).catch(() => '');
+        const pickNo = /sponsor|visa.*require/.test(gt);
+        const target = pickNo ? 'no' : 'yes';
         const radios = await group.$$('[role="radio"], input[type="radio"], label');
         let picked = false;
-        for (const radio of radios) {
-          const radioText = await radio.innerText().catch(async () => await radio.evaluate(el => el.value || '').catch(() => ''));
-          const t = (radioText || '').toLowerCase().trim();
-          if (t === targetText || t.startsWith(targetText)) { await radio.click().catch(() => {}); log(`  ✓ Radio: ${targetText} — ${groupText.slice(0, 40)}`); picked = true; break; }
+        for (const r of radios) {
+          const t = ((await r.innerText().catch(async () => await r.evaluate(el => el.value||'').catch(() => ''))) || '').toLowerCase().trim();
+          if (t === target || t.startsWith(target)) { await r.click().catch(() => {}); picked = true; break; }
         }
-        if (!picked && radios.length > 0) { await radios[0].click().catch(() => {}); log('  ✓ Radio: first option selected'); }
+        if (!picked && radios.length > 0) await radios[0].click().catch(() => {});
       }
     } catch(e) {}
 
+    // Multi-step check
     try {
       const submitExists = await page.$('button:has-text("Submit Application"), button[type="submit"]');
       if (!submitExists) {
-        const nextBtn = await page.$('button:has-text("Next"), button:has-text("Continue"), button:has-text("Next Step")');
-        if (nextBtn && await nextBtn.isVisible().catch(() => false)) { log('  👉 Multi-step form — clicking Next'); await nextBtn.click(); await page.waitForTimeout(1500); }
+        const nextBtn = await page.$('button:has-text("Next"), button:has-text("Continue")');
+        if (nextBtn && await nextBtn.isVisible().catch(() => false)) { log('  👉 Multi-step — clicking Next'); await nextBtn.click(); await page.waitForTimeout(1500); }
       }
     } catch(e) {}
 
-    const ashbyBtnSelectors = ['button[type="submit"]','button:has-text("Submit Application")','button:has-text("Submit application")','button:has-text("Submit")','button:has-text("Apply Now")','button:has-text("Apply now")','button:has-text("Apply")','[data-testid*="submit"]','[data-testid*="apply"]'];
+    // Find submit button
+    const ashbyBtnSelectors = ['button[type="submit"]','button:has-text("Submit Application")','button:has-text("Submit application")','button:has-text("Submit")','button:has-text("Apply Now")','button:has-text("Apply now")','button:has-text("Apply")'];
     let ashbyBtn = null;
     for (const sel of ashbyBtnSelectors) {
       const btn = page.locator(sel).first();
-      if (await btn.count() > 0 && await btn.isVisible().catch(() => false)) { ashbyBtn = btn; log(`  🔘 Found submit button: ${sel}`); break; }
+      if (await btn.count() > 0 && await btn.isVisible().catch(() => false)) { ashbyBtn = btn; log(`  🔘 Found: ${sel}`); break; }
     }
 
     if (!ashbyBtn) {
       const allBtns = await page.$$('button');
       const btnTexts = await Promise.all(allBtns.map(b => b.innerText().catch(() => '')));
-      log(`  ⚠ No submit button found. Buttons on page: ${btnTexts.filter(Boolean).join(' | ').slice(0, 100)}`);
+      log(`  ⚠ No submit button. Buttons: ${btnTexts.filter(Boolean).join(' | ').slice(0, 100)}`);
     } else {
       await ashbyBtn.scrollIntoViewIfNeeded();
       await ashbyBtn.focus();
       await page.waitForTimeout(300);
 
-      // Strategy 1: Tab+Enter — fires real KeyboardEvent through browser pipeline
-      log(`  🖱 Trying Tab+Enter approach...`);
+      // Strategy 1: Tab+Enter
+      log(`  🖱 Trying Tab+Enter...`);
       await ashbyBtn.evaluate(btn => btn.focus());
       await page.keyboard.press('Enter');
       await page.waitForTimeout(800);
 
       // Strategy 2: form.requestSubmit()
-      const stillOnApp = page.url().includes('/application') && !page.url().includes('success');
-      if (stillOnApp) {
+      if (page.url().includes('/application') && !page.url().includes('success')) {
         log(`  🔄 Trying form.requestSubmit()...`);
-        const submitted = await page.evaluate(() => {
-          const form = document.querySelector('form');
-          if (!form) return false;
-          try { form.requestSubmit(); return true; } catch(e) { form.submit(); return true; }
-        }).catch(() => false);
-        log(`  📋 requestSubmit result: ${submitted}`);
+        const submitted = await page.evaluate(() => { const f=document.querySelector('form'); if(!f)return false; try{f.requestSubmit();return true;}catch(e){f.submit();return true;} }).catch(() => false);
+        log(`  📋 requestSubmit: ${submitted}`);
         await page.waitForTimeout(800);
       }
 
-      // Strategy 3: standard click
-      const stillOnApp2 = page.url().includes('/application') && !page.url().includes('success');
-      if (stillOnApp2) {
-        log(`  🔄 Falling back to standard click...`);
-        await ashbyBtn.click({ delay: 50 });
+      // Strategy 3: humanized click
+      if (page.url().includes('/application') && !page.url().includes('success')) {
+        log(`  🔄 Humanized click...`);
+        const btnEl = await ashbyBtn.elementHandle();
+        if (btnEl) await humanizedClick(page, btnEl);
         await page.waitForTimeout(500);
+      }
 
-        // Strategy 4: React pointer events
-        const stillOnApp3 = page.url().includes('/application') && !page.url().includes('success');
-        if (stillOnApp3) {
-          log(`  🔄 Trying React pointer events...`);
-          await ashbyBtn.evaluate(btn => {
-            btn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, isTrusted: true }));
-            btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, isTrusted: true }));
-            btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, isTrusted: true }));
-            btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, isTrusted: true }));
-          });
-        }
+      // Strategy 4: React pointer events
+      if (page.url().includes('/application') && !page.url().includes('success')) {
+        log(`  🔄 React pointer events...`);
+        await ashbyBtn.evaluate(btn => {
+          btn.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true, isTrusted: true }));
+          btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, isTrusted: true }));
+          btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, isTrusted: true }));
+          btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, isTrusted: true }));
+        });
       }
     }
 
     const networkResp = await networkPromise;
     if (networkResp) {
       const status = networkResp.status();
-      log(`  📡 Network response: ${status} from ${networkResp.url().slice(0, 60)}`);
-      if (status >= 400) return { success: false, message: `Ashby server rejected: ${status}` };
+      log(`  📡 Network: ${status} from ${networkResp.url().slice(0, 60)}`);
+      if (status >= 400) return { success: false, message: `Ashby rejected: ${status}` };
+    } else {
+      log(`  📡 No POST detected`);
     }
 
     const ashbyResult = await ashbyPromise;
@@ -1274,24 +1201,20 @@ async function submitAshby(page, job, resumeText, resumePdfUrl, focus) {
     log(`  📍 ${ashbyUrl}`);
 
     if (ashbyResult || ashbyUrl.includes('/application/success') || ashbyUrl.includes('/thanks') || ashbyUrl.includes('/confirmation')) {
-      return { success: true, message: `Submitted via Ashby ✓` };
+      return { success: true, message: 'Submitted via Ashby ✓' };
     }
 
-    if (networkResp) log(`  📡 Network POST: ${networkResp.status()} from ${networkResp.url().slice(0, 80)}`);
-    else log(`  📡 No POST network request detected — form may not have submitted`);
-
-    const successEl = await page.$('[class*="successPage" i], [class*="success-page" i], [class*="confirmation" i], h1:has-text("Thank You"), h1:has-text("Application Submitted")').catch(() => null);
+    const successEl = await page.$('[class*="successPage" i], h1:has-text("Thank You"), h1:has-text("Application Submitted")').catch(() => null);
     if (successEl) return { success: true, message: 'Submitted via Ashby ✓ (success element)' };
 
-    log(`  ⚠ Still on /application page — form may not have submitted`);
-    const ashbyErrorSelectors = ['div[class*="_error"]','div[class*="_errorMessage"]','[aria-invalid="true"]','span[class*="error"]','[class*="error"]','[class*="invalid"]','p[class*="error"]','[data-has-errors]'];
+    log(`  ⚠ Still on /application`);
+    const ashbyErrorSelectors = ['div[class*="_error"]','[aria-invalid="true"]','span[class*="error"]','[class*="error"]','[class*="invalid"]'];
     let allErrors = [];
     for (const sel of ashbyErrorSelectors) {
       const els = await page.$$(sel);
       for (const el of els) { const t = (await el.textContent().catch(() => '')).trim(); if (t && t.length > 2 && !allErrors.includes(t)) allErrors.push(t); }
     }
-    if (allErrors.length > 0) log(`  📋 Ashby validation errors: ${allErrors.slice(0, 5).join(' | ')}`);
-    else log(`  📋 Ashby validation errors: (none detected)`);
+    log(`  📋 Ashby errors: ${allErrors.length > 0 ? allErrors.slice(0,5).join(' | ') : '(none)'}`);
 
     await page.screenshot({ path: '/tmp/ashby-debug.png', fullPage: true }).catch(() => {});
     return { success: false, message: `Ashby: no confirmation at ${ashbyUrl}` };
@@ -1320,8 +1243,8 @@ async function clearAndType(page, selector, value) {
     const el = await page.$(selector);
     if (!el || !await el.isVisible().catch(() => false)) return false;
     await el.scrollIntoViewIfNeeded(); await el.click({ clickCount: 3 });
-    await el.type(value, { delay: 30 });
-    await el.evaluate(e => { e.dispatchEvent(new Event('input', { bubbles: true })); e.dispatchEvent(new Event('change', { bubbles: true })); e.dispatchEvent(new Event('blur', { bubbles: true })); });
+    await el.type(value, { delay: 50 + Math.floor(Math.random() * 50) });
+    await el.evaluate(e => { e.dispatchEvent(new Event('input',{bubbles:true})); e.dispatchEvent(new Event('change',{bubbles:true})); e.dispatchEvent(new Event('blur',{bubbles:true})); });
     return true;
   } catch (e) { return false; }
 }
@@ -1391,49 +1314,38 @@ async function uploadResumePdf(page, pdfUrl, selectors) {
         const response = await fetch(pdfUrl, { signal: dlController.signal });
         clearTimeout(dlTimeout);
         if (!response.ok) { log(`  ⚠ Resume download failed: ${response.status}`); return false; }
-        const buffer = await response.arrayBuffer();
-        fs.writeFileSync(tmpPath, Buffer.from(buffer));
+        fs.writeFileSync(tmpPath, Buffer.from(await response.arrayBuffer()));
       } catch(dlErr) {
         clearTimeout(dlTimeout);
-        log(`  ⚠ Resume download error: ${dlErr.message.slice(0,40)}`);
+        log(`  ⚠ Download error: ${dlErr.message.slice(0,40)}`);
         if (!fs.existsSync(tmpPath)) return false;
-        log(`  📎 Using cached resume`);
       }
     } else { log(`  📎 Using cached resume`); }
 
-    if (!fs.existsSync(tmpPath) || fs.statSync(tmpPath).size === 0) { log(`  ⚠ Resume file empty or missing`); return false; }
-    log(`  💾 Resume ready: ${fs.statSync(tmpPath).size} bytes at ${tmpPath}`);
+    if (!fs.existsSync(tmpPath) || fs.statSync(tmpPath).size === 0) { log(`  ⚠ Resume missing`); return false; }
+    log(`  💾 Resume ready: ${fs.statSync(tmpPath).size} bytes`);
 
     for (const sel of selectors) {
       const fileInput = await page.$(sel);
       if (fileInput) {
-        log(`  📎 Setting file on input: ${sel}`);
         await fileInput.setInputFiles(tmpPath);
+        // Fire change event so React registers the file
+        await fileInput.evaluate(el => {
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+        });
         await page.waitForTimeout(1500);
-        log(`  ✅ Resume uploaded via setInputFiles`);
+        log(`  ✅ Resume uploaded`);
         return true;
       }
     }
-
-    await (async () => {
-      try {
-        const fileChooser = await Promise.race([page.waitForEvent('filechooser'), new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 3000))]).catch(() => null);
-        if (!fileChooser) return;
-        await page.click('input[type="file"], label[for*="resume"]').catch(() => {});
-        await fileChooser.setFiles(tmpPath);
-        await page.waitForTimeout(1500);
-        log(`  ✅ Resume uploaded via file chooser`);
-      } catch(fcErr) { log(`  ⚠ File chooser skipped: ${fcErr.message.slice(0, 40)}`); }
-    })();
-
     log(`  ⚠ No file input found`);
     return false;
   } catch (e) { log(`  ⚠ Resume upload failed: ${e.message}`); return false; }
 }
 
 function saveLog() {
-  const logPath = `/tmp/submission-log-${Date.now()}.json`;
-  fs.writeFileSync(logPath, JSON.stringify(runLog, null, 2));
+  fs.writeFileSync(`/tmp/submission-log-${Date.now()}.json`, JSON.stringify(runLog, null, 2));
   log(`\n📝 Run log saved`);
 }
 

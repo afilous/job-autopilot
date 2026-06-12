@@ -85,13 +85,13 @@ async function submitAshby(page, job, resumeText, resumePdfUrl) {
               let fillVal = null;
 
               if (/\bfull.?name\b/.test(meta) || (/\bname\b/.test(meta) && !meta.includes('company') && !meta.includes('employer') && !meta.includes('file') && !meta.includes('school') && !meta.includes('hear') && meta.length < 200)) {
-                fillVal = meta.includes('first') ? PROFILE.first_name : meta.includes('last') ? PROFILE.last_name : PROFILE.full_name;
+                fillVal = meta.includes('first') ? PROFILE.first_name : meta.includes('last') ? PROFILE.last_name : meta.includes('middle') ? '' : PROFILE.full_name;
               }
               else if (/\bemail\b/.test(meta) && meta.length < 200) fillVal = PROFILE.email;
               else if (/\bphone\b|\btel\b|phone number/.test(meta) && meta.length < 200) fillVal = PROFILE.phone_formatted;
               else if (/linkedin/.test(meta)) { const li = PROFILE.linkedin; fillVal = li.startsWith('http') ? li : 'https://' + li; }
               else if (/\bwebsite\b|\bportfolio\b/.test(meta)) fillVal = PROFILE.website;
-              else if (/how did you hear|where did you hear|referral source/.test(meta)) fillVal = 'LinkedIn';
+              else if (/how did you hear|where did you|referral source|find this job|job posting/.test(meta)) fillVal = 'LinkedIn';
               else if (/country.*reside|country.*currently|currently.*reside/.test(meta)) fillVal = 'United States';
               else if (/country/.test(meta) && meta.length < 100) fillVal = 'United States';
               else if (/require.*sponsor|sponsor.*work|visa.*sponsor/.test(meta)) fillVal = 'No';
@@ -100,8 +100,11 @@ async function submitAshby(page, job, resumeText, resumePdfUrl) {
               else if (/preferred.*first|first.*preferred/.test(meta)) fillVal = PROFILE.first_name;
               else if (/preferred.*last|last.*preferred/.test(meta)) fillVal = PROFILE.last_name;
               else if (/current.*employer|most recent.*employer/.test(meta)) fillVal = 'Stealth Startup';
-              else if (/location/.test(meta) && meta.length < 80) fillVal = 'San Mateo, CA';
+              else if (/location|city.*country|country.*city/.test(meta) && meta.length < 80) fillVal = 'San Mateo, CA, United States';
               else if (/current.*company|most recent.*company/.test(meta)) fillVal = 'Stealth Startup';
+              else if (/salary|compensation|expected.*pay|pay.*expect/.test(meta)) fillVal = '145000 USD';
+              else if (/notice period|notice.*period/.test(meta)) fillVal = 'Immediately available';
+              else if (/relative|family member|spouse|partner/.test(meta)) fillVal = '';
               else if (/proud of|exceptional|impressive|something you/.test(meta)) fillVal = ESSAY_ANSWER;
               else if (/what excites you|why.*want.*work|why do you want|why.*company|why.*role|why.*join|why.*interest|most excit|drawn to/.test(meta)) fillVal = ESSAY_ANSWERS.why_company;
               else if (/messy.*ambiguous|hardest part/.test(meta)) fillVal = ESSAY_ANSWERS.ambiguous;
@@ -111,13 +114,12 @@ async function submitAshby(page, job, resumeText, resumePdfUrl) {
               else if (/anything else|additional information/.test(meta)) fillVal = 'Please see my attached resume for additional details.';
               else if (/notice period|earliest.*start|when.*available/.test(meta)) fillVal = 'Immediately';
               else if (/previously.*employed|former.*employee/.test(meta)) fillVal = 'No';
-              else if (/salary|compensation/.test(meta)) fillVal = PROFILE.salary_expectation;
-              // Textarea catch-all — fill any visible textarea with essay answer
               else if (await input.evaluate(el => el.tagName.toLowerCase() === 'textarea').catch(() => false)) {
+                // Textarea catch-all — fill with essay answer
                 fillVal = ESSAY_ANSWER;
               }
 
-              if (fillVal && fillVal !== currentVal) {
+              if (fillVal !== null && fillVal !== currentVal) {
                 await input.scrollIntoViewIfNeeded();
                 try {
                   await input.focus(); await input.click({ clickCount: 3 });
@@ -132,7 +134,7 @@ async function submitAshby(page, job, resumeText, resumePdfUrl) {
                     });
                   }
                   const confirmed = await input.evaluate(el => el.value).catch(() => '');
-                  if (!confirmed || confirmed.length < 3) {
+                  if (!confirmed && fillVal.length > 0) {
                     await input.fill('');
                     await input.type(fillVal.slice(0, 200), { delay: 20 });
                   }
@@ -154,6 +156,40 @@ async function submitAshby(page, job, resumeText, resumePdfUrl) {
       }
     } catch(e) { log('  ⚠ Field interceptor: ' + e.message.slice(0, 50)); }
 
+    // ── getByLabel sweep — catches fields missed by input loop ────────────────
+    try {
+      const labelMap = [
+        ['full name', PROFILE.full_name],
+        ['first name', PROFILE.first_name],
+        ['last name', PROFILE.last_name],
+        ['email', PROFILE.email],
+        ['phone', PROFILE.phone_formatted],
+        ['linkedin', PROFILE.linkedin],
+        ['location', 'San Mateo, CA, United States'],
+        ['salary', '145000 USD'],
+        ['notice period', 'Immediately available'],
+        ['where did you find', 'LinkedIn'],
+        ['how did you hear', 'LinkedIn'],
+      ];
+      for (const [label, value] of labelMap) {
+        try {
+          const el = page.getByLabel(label, { exact: false }).first();
+          if (await el.count() === 0) continue;
+          if (!await el.isVisible().catch(() => false)) continue;
+          const tag = await el.evaluate(e => e.tagName.toLowerCase()).catch(() => '');
+          if (tag === 'select') continue; // handled separately
+          const current = await el.inputValue().catch(() => '');
+          if (current && current.length > 2) continue; // already filled
+          await el.fill(value);
+          await el.evaluate(e => {
+            e.dispatchEvent(new Event('input', { bubbles: true }));
+            e.dispatchEvent(new Event('change', { bubbles: true }));
+          });
+          log(`  ✓ getByLabel "${label}": ${value.slice(0, 30)}`);
+        } catch(e) {}
+      }
+    } catch(e) {}
+
     // ── Phone sweep ───────────────────────────────────────────────────────────
     try {
       let phoneFilled = false;
@@ -167,16 +203,6 @@ async function submitAshby(page, job, resumeText, resumePdfUrl) {
         phoneFilled = true; break;
       }
       if (!phoneFilled) log('  ⚠ Phone not found');
-    } catch(e) {}
-
-    // ── Location ──────────────────────────────────────────────────────────────
-    try {
-      const li = await page.$('input[placeholder*="Location" i],input[aria-label*="location" i],input[placeholder*="City" i]');
-      if (li && await li.isVisible().catch(() => false)) {
-        await li.click(); await li.type('San Mateo, CA', { delay: 50 }); await page.waitForTimeout(1000);
-        const opt = await page.$('[role="option"]');
-        if (opt) await opt.click(); else { await page.keyboard.press('ArrowDown'); await page.keyboard.press('Enter'); }
-      }
     } catch(e) {}
 
     // ── Consent checkboxes ────────────────────────────────────────────────────
@@ -215,84 +241,50 @@ async function submitAshby(page, job, resumeText, resumePdfUrl) {
 
     await page.waitForTimeout(Math.floor(Math.random() * 800 + 400));
 
-    // ── Ashby Yes/No button handler ───────────────────────────────────────────
-    // Ashby renders Yes/No questions as <button> elements with class _option_*
-    // NOT as radio inputs — so standard radio sweeps don't work.
-    // We find each question group, read its label, then click the right button.
+    // ── Yes/No button handler ─────────────────────────────────────────────────
+    // Ashby renders Yes/No questions as <button> elements, not radio inputs.
+    // We find ALL visible buttons with text "Yes" or "No" and click based on
+    // the surrounding question text context.
     try {
-      // Find all Yes/No button groups
-      const yesNoContainers = await page.$$('div[class*="_yesno_"], div[class*="yesNo"], div[class*="yes-no"]');
-      for (const container of yesNoContainers) {
-        // Get the question text from the nearest label
-        const questionText = await container.evaluate(el => {
-          let p = el.parentElement;
-          for (let i = 0; i < 5; i++) {
-            if (!p) break;
-            const label = p.querySelector('label, [class*="_label_"], [class*="label"]');
-            if (label) return label.innerText.toLowerCase();
-            p = p.parentElement;
-          }
-          return '';
-        }).catch(() => '');
+      const allButtons = await page.$$('button');
+      for (const btn of allButtons) {
+        const btnText = (await btn.innerText().catch(() => '')).trim();
+        if (btnText !== 'Yes' && btnText !== 'No') continue;
+        if (!await btn.isVisible().catch(() => false)) continue;
 
-        // Determine correct answer based on question content
-        const pickNo = /sponsor|visa|require.*work|work.*permit|currently.*authorized/.test(questionText);
-        const pickYes = /in.person|in-person|office|hybrid|relocat|authorized.*work|work.*authorized|eligible.*work|legally.*work/.test(questionText);
-
-        const targetText = pickNo ? 'No' : pickYes ? 'Yes' : null;
-        if (!targetText) continue;
-
-        // Find and click the right button
-        const buttons = await container.$$('button');
-        for (const btn of buttons) {
-          const btnText = (await btn.innerText().catch(() => '')).trim();
-          if (btnText === targetText) {
-            await btn.click();
-            log(`  ✓ Yes/No button: "${targetText}" for "${questionText.slice(0, 50)}"`);
-            break;
-          }
-        }
-      }
-
-      // Fallback: find by button class pattern _option_ and nearby label text
-      const optionButtons = await page.$$('button[class*="_option_"]');
-      for (const btn of optionButtons) {
-        const isAlreadySelected = await btn.evaluate(el => {
-          const s = window.getComputedStyle(el);
-          // Selected buttons have a primary color border/background
+        // Check if already selected (has a distinct style vs unselected)
+        const isSelected = await btn.evaluate(el => {
           return el.getAttribute('aria-pressed') === 'true' ||
             el.getAttribute('aria-selected') === 'true' ||
             el.getAttribute('data-selected') === 'true' ||
-            el.classList.toString().includes('selected') ||
-            el.classList.toString().includes('active');
+            el.getAttribute('data-state') === 'on' ||
+            el.getAttribute('data-state') === 'active';
         }).catch(() => false);
-        if (isAlreadySelected) continue;
+        if (isSelected) continue;
 
-        const btnText = (await btn.innerText().catch(() => '')).trim();
-        if (btnText !== 'Yes' && btnText !== 'No') continue;
-
-        // Get question context
+        // Get surrounding question text
         const questionText = await btn.evaluate(el => {
           let p = el.parentElement;
-          for (let i = 0; i < 6; i++) {
+          for (let i = 0; i < 8; i++) {
             if (!p) break;
-            if (p.innerText && p.innerText.length > 10) return p.innerText.toLowerCase();
+            if (p.innerText && p.innerText.length > 15) return p.innerText.toLowerCase();
             p = p.parentElement;
           }
           return '';
         }).catch(() => '');
 
-        const shouldPickNo = /sponsor|visa|require.*sponsor|sponsorship/.test(questionText);
-        const shouldPickYes = /in.person|in-person|office|hybrid|relocat|authorized|eligible|legally/.test(questionText);
+        // Determine correct answer
+        const shouldPickNo = /sponsor|visa|relative|family member|currently work|worked.*before|former.*employee|ai tool|use.*ai|artificial intel/.test(questionText);
+        const shouldPickYes = /in.person|in-person|office|hybrid|relocat|authorized|eligible|legally|agree|acknowledge|understand|policy|read.*agree|indicate.*yes/.test(questionText);
 
         if (btnText === 'No' && shouldPickNo) {
           await btn.click();
-          log(`  ✓ Clicked No: "${questionText.slice(0, 50)}"`);
-          await page.waitForTimeout(200);
+          log(`  ✓ Clicked No: "${questionText.slice(0, 60)}"`);
+          await page.waitForTimeout(300);
         } else if (btnText === 'Yes' && shouldPickYes) {
           await btn.click();
-          log(`  ✓ Clicked Yes: "${questionText.slice(0, 50)}"`);
-          await page.waitForTimeout(200);
+          log(`  ✓ Clicked Yes: "${questionText.slice(0, 60)}"`);
+          await page.waitForTimeout(300);
         }
       }
     } catch(e) { log('  ⚠ Yes/No buttons: ' + e.message.slice(0, 50)); }
@@ -306,7 +298,7 @@ async function submitAshby(page, job, resumeText, resumePdfUrl) {
           for (let i = 0; i < 5; i++) { if (!p) break; if (p.innerText?.length > 5) return p.innerText.toLowerCase(); p = p.parentElement; }
           return '';
         }).catch(() => '');
-        if (/how did you hear|where did you hear|referral|source/.test(pt)) {
+        if (/how did you hear|where did you|referral|source|find.*job|job.*posting/.test(pt)) {
           await cb.click().catch(() => {}); await new Promise(r => setTimeout(r, 500));
           const opts = await page.$$('[role="option"]');
           for (const opt of opts) {

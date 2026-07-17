@@ -2,9 +2,6 @@ name: Job Autopilot — Submit Applications
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 */3 * * *'  # Every 3 hours automatically
-
 jobs:
   submit:
     runs-on: ubuntu-latest

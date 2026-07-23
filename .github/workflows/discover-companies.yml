@@ -26,4 +26,5 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}   # NEW — for ats-site-search-discovery.js
         run: node discover-companies.js

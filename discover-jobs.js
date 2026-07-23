@@ -1,10 +1,12 @@
 /**
  * Job Autopilot — Search-based Job Discovery
- * Sources: Adzuna + JSearch + SerpApi
- * Scores jobs at insert time using same engine as discover-jobs-api.js
+ * Sources: Adzuna + JSearch + SerpApi (+ SerpApi site: search)
+ * Scores jobs at insert time using the shared engine in lib/scoring.js
  */
 
 const { createClient } = require('@supabase/supabase-js');
+const { scoreJob } = require('./lib/scoring');
+const { guessAtsType, guessCompanySlug, looksLikeJobUrl } = require('./lib/url-capture');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
@@ -18,206 +20,21 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── Scoring engine (same as discover-jobs-api.js) ─────────────────────────────
+// ── Generic ATS URL parsing ───────────────────────────────────────────────────
+// Replaces the old ATS_PATTERNS regex array, which only recognized Greenhouse/
+// Lever/Ashby URLs and silently dropped everything else (Workday,
+// SmartRecruiters, Workable, etc.) even when the job itself was a great match.
 
-const TITLE_EXACT_TARGETS = [
-  'strategy & operations', 'strategy and operations', 'strategic operations',
-  'business operations', 'biz ops', 'bizops', 'biz-ops', 'business ops',
-  'revenue operations', 'revops', 'rev ops',
-  'gtm operations', 'gtm ops', 'gtm strategy', 'go-to-market operations',
-  'sales operations', 'sales ops', 'sales strategy and operations',
-  'sales strategy & operations', 'commercial operations',
-  'chief of staff', 'special projects', 'strategic initiatives',
-  'head of operations', 'head of ops', 'strategic planning',
-  'growth operations', 'growth ops', 'growth strategy',
-  'corporate strategy', 'business strategy',
-];
-
-const TITLE_STRONG_PAIRS = [
-  ['operations', ['strategy', 'business', 'revenue', 'sales', 'gtm', 'growth', 'commercial', 'central', 'general']],
-  ['strategy', ['operations', 'business', 'growth', 'corporate', 'commercial', 'revenue', 'sales', 'gtm']],
-  ['program manager', ['operations', 'strategy', 'ops', 'sales', 'gtm', 'revenue', 'business', 'growth', 'transformation', 'strategic', 'product operations', 'commercial']],
-  ['program director', ['operations', 'strategy', 'ops', 'sales', 'gtm', 'revenue', 'business']],
-];
-
-const GOOD_DEPARTMENTS = [
-  'strategy', 'operations', 'business operations', 'revenue operations',
-  'sales operations', 'gtm', 'go-to-market', 'growth', 'finance',
-  'strategic finance', 'chief of staff', 'special projects',
-  'business development', 'commercial', 'revenue',
-];
-
-const BAD_DEPARTMENTS = [
-  'engineering', 'software', 'product', 'design', 'data science',
-  'machine learning', 'infrastructure', 'security', 'legal', 'hr',
-  'human resources', 'recruiting', 'talent', 'marketing', 'it ',
-  'information technology', 'clinical', 'medical', 'nursing',
-  'facilities', 'supply chain', 'logistics', 'manufacturing',
-];
-
-const TITLE_DISQUALIFIERS = [
-  'software engineer', 'software developer', 'frontend', 'backend', 'full stack',
-  'devops', 'dev ops', 'data engineer', 'data scientist', 'ml engineer',
-  'ai engineer', 'machine learning', 'infrastructure engineer', 'platform engineer',
-  'solutions engineer', 'sales engineer', 'security engineer',
-  'store operations', 'retail operations', 'field operations', 'clinical operations',
-  'warehouse operations', 'manufacturing operations', 'plant operations',
-  'restaurant operations', 'hotel operations', 'fleet operations',
-  'facilities operations', 'distribution operations', 'supply chain operations',
-  'it operations', 'security operations', 'noc ', 'help desk',
-  'account executive', 'account manager', 'sales representative', 'sales rep',
-  'bdr ', 'sdr ', 'inside sales', 'outside sales',
-  'product manager', 'product designer', 'ux ', 'ui ',
-  'data analyst', 'financial analyst', 'accountant', 'controller',
-  'legal counsel', 'attorney', 'paralegal',
-  'recruiter', 'talent acquisition', 'hr business partner',
-  'content writer', 'copywriter', 'graphic designer',
-  'vp ', 'vice president', 'svp', 'evp', 'chief ', 'coo', 'ceo', 'cfo', 'cto',
-  // Physical ops disqualifiers — critical for open web search
-  'store manager', 'district manager', 'regional manager', 'area manager',
-  'shift supervisor', 'floor manager', 'branch manager',
-  'warehouse manager', 'fulfillment', 'distribution center',
-  'plant manager', 'production manager', 'manufacturing manager',
-  'restaurant manager', 'food service', 'catering manager',
-  'hotel manager', 'front desk', 'housekeeping',
-  'nurse', 'clinical', 'patient', 'medical', 'pharmacy',
-  'driver', 'delivery', 'route', 'trucker',
-  'construction', 'contractor', 'foreman', 'superintendent',
-];
-
-const GOOD_DESCRIPTION_SIGNALS = [
-  'cross-functional', 'stakeholder', 'p&l', 'okr', 'kpi', 'gtm',
-  'go-to-market', 'revenue operations', 'sales operations', 'business operations',
-  'strategy', 'operational excellence', 'process improvement', 'sql',
-  'data-driven', 'analytics', 'reporting', 'roadmap', 'prioritization',
-  'chief of staff', 'special projects', 'scaled', 'hypergrowth',
-  'cross functional', 'program management', 'project management',
-  'business intelligence', 'tableau', 'salesforce', 'hubspot',
-  'annual planning', 'quarterly planning', 'headcount', 'budget',
-  'saas', 'startup', 'series', 'venture', 'yc', 'y combinator',
-  'seed', 'growth stage', 'scale-up', 'scaleup',
-];
-
-const BAD_DESCRIPTION_SIGNALS = [
-  'plc', 'cnc', 'forklift', 'warehouse', 'clinical trial', 'patient care',
-  'nursing', 'hospital', 'icu', 'medical device', 'retail store',
-  'store manager', 'district manager', 'field technician', 'field service',
-  'manufacturing plant', 'production line', 'assembly line',
-  'truck', 'driver', 'fleet management', 'route optimization',
-  'customer service representative', 'call center',
-  'cvs', 'walgreens', 'target', 'walmart', 'costco', 'sephora', 'ulta',
-  'macy', 'nordstrom', 'gap ', 'h&m', 'zara', 'uniqlo',
-  'mcdonald', 'starbucks', 'chipotle', 'domino', 'subway',
-];
-
-const EXCLUDE_LOCATIONS = [
-  'london', 'united kingdom', ' uk,', ' uk ', 'emea', 'germany', 'france',
-  'canada', 'toronto', 'vancouver', 'montreal', 'ontario', 'british columbia',
-  'australia', 'singapore', 'india', 'apac', 'japan', 'mexico',
-  'brazil', 'argentina', 'chile', 'bangalore', 'chennai', 'gurugram',
-];
-
-const REMOTE_SIGNALS = [
-  'remote', 'anywhere', 'distributed', 'work from home', 'wfh',
-  'us remote', 'usa remote', 'united states remote', 'north america remote', 'nationwide',
-];
-
-const BAY_AREA_SIGNALS = [
-  'san francisco', 'sf,', ' sf ', 'bay area', 'palo alto', 'mountain view',
-  'menlo park', 'san mateo', 'foster city', 'redwood city', 'sunnyvale',
-  'santa clara', 'cupertino', 'campbell', 'san jose', 'oakland', 'berkeley',
-  'burlingame', 'south san francisco', 'milpitas', 'fremont', 'pleasanton',
-  'walnut creek', 'silicon valley', 'peninsula',
-];
-
-// Open web search needs stricter scoring — no benefit of doubt for ambiguous titles
-function scoreJobStrict({ title, department, description, location, company }) {
-  const t = (title || '').toLowerCase();
-  const dept = (department || '').toLowerCase();
-  const desc = (description || '').toLowerCase();
-  const loc = (location || '').toLowerCase();
-
-  // Location filter
-  if (EXCLUDE_LOCATIONS.some(k => loc.includes(k))) return 0;
-  const isRemote = REMOTE_SIGNALS.some(k => loc.includes(k));
-  const isBayArea = BAY_AREA_SIGNALS.some(k => loc.includes(k));
-  const noLocation = !loc || loc.length < 2;
-  if (!isRemote && !isBayArea && !noLocation) return 0;
-
-  // Title disqualifiers
-  if (TITLE_DISQUALIFIERS.some(k => t.includes(k))) return 0;
-
-  // Department disqualifiers
-  if (BAD_DEPARTMENTS.some(k => dept.includes(k))) return 0;
-
-  // Description bad signals
-  if (desc.length > 100) {
-    const badCount = BAD_DESCRIPTION_SIGNALS.filter(k => desc.includes(k)).length;
-    if (badCount >= 1) return 0; // Stricter for open web — one bad signal is enough
-  }
-
-  // Company name bad signals (open web includes retail/food companies)
-  const companyLower = (company || '').toLowerCase();
-  const badCompanies = ['cvs', 'walgreen', 'target', 'walmart', 'costco', 'sephora', 'ulta',
-    'macy', 'nordstrom', 'gap', 'h&m', 'zara', 'uniqlo', 'mcdonald', 'starbucks',
-    'chipotle', 'domino', 'subway', 'pizza', 'burger', 'taco', 'wendys',
-    'dollar tree', 'dollar general', 'family dollar', 'autozone', 'advance auto',
-    'lowes', 'home depot', 'bed bath', 'best buy', 'gamestop', 'petco', 'petsmart',
-    'uhaul', 'enterprise rent', 'hertz', 'avis', 'budget rent',
-    'marriott', 'hilton', 'hyatt', 'ihg', 'wyndham', 'choice hotel',
-    'ups ', 'fedex', 'usps', 'dhl', 'xpo logistics', 'amazon logistics'];
-  if (badCompanies.some(k => companyLower.includes(k))) return 0;
-
-  // Exact title match
-  if (TITLE_EXACT_TARGETS.some(k => t.includes(k))) return 90;
-
-  // Good department match
-  const hasGoodDept = GOOD_DEPARTMENTS.some(k => dept.includes(k));
-  if (hasGoodDept && (t.includes('operations') || t.includes('strategy') || t.includes('program manager'))) {
-    return 85;
-  }
-
-  // Strong title pairs
-  for (const [primary, qualifiers] of TITLE_STRONG_PAIRS) {
-    if (t.includes(primary) && qualifiers.some(q => t.includes(q))) return 82;
-  }
-
-  // For open web — ambiguous titles MUST have strong description signals
-  const isAmbiguous = t.includes('operations manager') || t.includes('program manager') ||
-    t.includes('operations lead') || t.includes('strategy manager');
-
-  if (isAmbiguous) {
-    if (desc.length < 100) return 0; // No description = too risky from open web
-    const goodCount = GOOD_DESCRIPTION_SIGNALS.filter(k => desc.includes(k)).length;
-    if (goodCount >= 5) return 82;
-    if (goodCount >= 3) return 78;
-    return 0; // Open web ambiguous title needs strong signals
-  }
-
-  return 0; // Open web: if it doesn't match clearly, archive it
+function parseJobUrl(url) {
+  if (!looksLikeJobUrl(url)) return null;
+  return {
+    ats_type: guessAtsType(url),
+    ats_slug: guessCompanySlug(url),
+    url: url.split('?')[0],
+  };
 }
 
-// ── ATS URL parsing ───────────────────────────────────────────────────────────
-
-const ATS_PATTERNS = [
-  { regex: /boards\.greenhouse\.io\/([^/]+)\/jobs\/(\d+)/, ats_type: 'greenhouse' },
-  { regex: /job-boards\.greenhouse\.io\/([^/]+)\/jobs\/(\d+)/, ats_type: 'greenhouse' },
-  { regex: /jobs\.lever\.co\/([^/]+)\/([a-f0-9-]{36})/, ats_type: 'lever' },
-  { regex: /jobs\.ashbyhq\.com\/([^/]+)\/([a-f0-9-]{36})/, ats_type: 'ashby' },
-];
-
-function parseAtsUrl(url) {
-  if (!url) return null;
-  for (const { regex, ats_type } of ATS_PATTERNS) {
-    const match = url.match(regex);
-    if (match) {
-      return { ats_type, ats_slug: match[1].toLowerCase(), external_id: match[2], url: url.split('?')[0] };
-    }
-  }
-  return null;
-}
-
-// ── Search queries ────────────────────────────────────────────────────────────
+// ── Search queries (Adzuna) ────────────────────────────────────────────────────
 
 const QUERIES = [
   'strategy and operations manager San Francisco',
@@ -262,10 +79,10 @@ async function fetchAdzuna() {
       for (const job of (data.results || [])) {
         const candidateUrls = [job.redirect_url, job.adref, job.apply_url].filter(Boolean);
         let atsInfo = null;
-        for (const u of candidateUrls) { atsInfo = parseAtsUrl(u); if (atsInfo) break; }
+        for (const u of candidateUrls) { atsInfo = parseJobUrl(u); if (atsInfo) break; }
         if (!atsInfo && job.description) {
           const urlMatches = job.description.match(/https?:\/\/[^\s"'<>]+/g) || [];
-          for (const u of urlMatches) { atsInfo = parseAtsUrl(u); if (atsInfo) break; }
+          for (const u of urlMatches) { atsInfo = parseJobUrl(u); if (atsInfo) break; }
         }
         if (!atsInfo) continue;
 
@@ -273,7 +90,7 @@ async function fetchAdzuna() {
         const location = job.location?.display_name || '';
         const company = job.company?.display_name || atsInfo.ats_slug;
         const description = job.description || '';
-        const score = scoreJobStrict({ title, department: '', description, location, company });
+        const score = scoreJob({ title, department: '', description, location, company }, { strict: true });
         if (score > 0) jobs.push({ job_title: title, company, source: 'adzuna', match_score: score, ...atsInfo, location });
       }
 
@@ -315,14 +132,14 @@ async function fetchJSearch() {
       for (const job of (data.data || [])) {
         const candidateUrls = [job.job_apply_link, job.job_google_link, job.job_url, ...(job.apply_options||[]).map(o=>o.apply_link)].filter(Boolean);
         let atsInfo = null;
-        for (const u of candidateUrls) { atsInfo = parseAtsUrl(u); if (atsInfo) break; }
+        for (const u of candidateUrls) { atsInfo = parseJobUrl(u); if (atsInfo) break; }
         if (!atsInfo) continue;
 
         const title = job.job_title || '';
         const location = `${job.job_city || ''} ${job.job_state || ''} ${job.job_country || ''}`.trim();
         const company = job.employer_name || atsInfo.ats_slug;
         const description = job.job_description || '';
-        const score = scoreJobStrict({ title, department: '', description, location, company });
+        const score = scoreJob({ title, department: '', description, location, company }, { strict: true });
         if (score > 0) jobs.push({ job_title: title, company, source: 'jsearch', match_score: score, ...atsInfo, location });
       }
 
@@ -335,7 +152,7 @@ async function fetchJSearch() {
   return jobs;
 }
 
-// ── SerpApi ───────────────────────────────────────────────────────────────────
+// ── SerpApi (google_jobs — structured job listings) ───────────────────────────
 
 async function fetchSerpApi() {
   if (!SERPAPI_KEY) { log('⏭ SerpApi: no credentials'); return []; }
@@ -360,14 +177,14 @@ async function fetchSerpApi() {
         const applyLinks = (job.apply_options||[]).map(o=>o.link);
         const candidateUrls = [job.job_id, ...applyLinks].filter(Boolean);
         let atsInfo = null;
-        for (const u of candidateUrls) { atsInfo = parseAtsUrl(u); if (atsInfo) break; }
+        for (const u of candidateUrls) { atsInfo = parseJobUrl(u); if (atsInfo) break; }
         if (!atsInfo) continue;
 
         const title = job.title || '';
         const location = job.location || '';
         const company = job.company_name || atsInfo.ats_slug;
         const description = job.description || '';
-        const score = scoreJobStrict({ title, department: '', description, location, company });
+        const score = scoreJob({ title, department: '', description, location, company }, { strict: true });
         if (score > 0) jobs.push({ job_title: title, company, source: 'serpapi', match_score: score, ...atsInfo, location });
       }
 
@@ -380,15 +197,75 @@ async function fetchSerpApi() {
   return jobs;
 }
 
+// ── NEW: SerpApi site:-restricted search across ATS platforms ────────────────
+// Uses the `google` engine (not `google_jobs`) so the site: operator works.
+// Verified this session: a single query per domain surfaces companies never
+// in the hardcoded slug lists (8+ new companies each on Ashby and Greenhouse
+// from one query apiece).
+
+const ATS_SITE_DOMAINS = [
+  'jobs.ashbyhq.com', 'boards.greenhouse.io', 'job-boards.greenhouse.io',
+  'jobs.lever.co', 'jobs.smartrecruiters.com', 'apply.workable.com', 'jobs.workable.com',
+];
+
+const SITE_SEARCH_TITLE_GROUPS = [
+  '"strategy and operations" OR "strategy & operations" OR "business operations manager"',
+  '"chief of staff" OR "biz ops" OR "bizops"',
+  '"revenue operations manager" OR "gtm operations" OR "sales strategy and operations"',
+  '"product operations" OR "growth operations" OR "commercial operations manager"',
+];
+
+async function fetchSerpApiSiteSearch() {
+  if (!SERPAPI_KEY) { log('⏭ SerpApi site search: no credentials'); return []; }
+  log('🔍 SerpApi: site-restricted search...');
+  const jobs = [];
+
+  for (const domain of ATS_SITE_DOMAINS) {
+    for (const titleGroup of SITE_SEARCH_TITLE_GROUPS) {
+      try {
+        const q = `site:${domain} ${titleGroup}`;
+        const params = new URLSearchParams({ engine: 'google', q, num: '20', api_key: SERPAPI_KEY });
+        const res = await fetch(`https://serpapi.com/search?${params}`, { signal: AbortSignal.timeout(15000) });
+        if (!res.ok) continue;
+        const data = await res.json();
+        const organic = data.organic_results || [];
+
+        for (const r of organic) {
+          const atsInfo = parseJobUrl(r.link);
+          if (!atsInfo) continue;
+          const title = r.title || '';
+          const snippet = r.snippet || '';
+          const score = scoreJob({ title, department: '', description: snippet, location: '', company: atsInfo.ats_slug }, { strict: true });
+          if (score > 0) {
+            jobs.push({ job_title: title, company: atsInfo.ats_slug, source: 'serpapi-site-search', match_score: score, ...atsInfo, location: '' });
+          }
+        }
+        log(`  ✓ site:${domain} "${titleGroup.slice(0, 30)}..." → ${organic.length} hits`);
+        await sleep(1200);
+      } catch (e) {
+        log(`  ⚠ Site search error: ${e.message}`);
+      }
+    }
+  }
+
+  log(`✅ SerpApi site search: ${jobs.length} relevant ATS jobs`);
+  return jobs;
+}
+
 // ── Insert jobs ───────────────────────────────────────────────────────────────
+// Dedupe on `url` instead of `external_id` -- the generic parseJobUrl() doesn't
+// extract a clean external_id the way the old Greenhouse/Lever/Ashby-only
+// regex did, so url is now the reliable unique key across all sources.
+// Requires a DB-level unique constraint on applications.url for this to be
+// fully race-safe: ALTER TABLE applications ADD CONSTRAINT applications_url_unique UNIQUE (url);
 
 async function insertJobs(jobs) {
   if (jobs.length === 0) return { inserted: 0, archived: 0 };
 
-  const externalIds = jobs.map(j => j.external_id).filter(Boolean);
-  const { data: existing } = await supabase.from('applications').select('external_id').in('external_id', externalIds);
-  const existingIds = new Set((existing || []).map(e => e.external_id));
-  const newJobs = jobs.filter(j => j.external_id && !existingIds.has(j.external_id));
+  const urls = jobs.map(j => j.url).filter(Boolean);
+  const { data: existing } = await supabase.from('applications').select('url').in('url', urls);
+  const existingUrls = new Set((existing || []).map(e => e.url));
+  const newJobs = jobs.filter(j => j.url && !existingUrls.has(j.url));
   if (newJobs.length === 0) return { inserted: 0, archived: 0 };
 
   const toQueue = newJobs.filter(j => j.match_score >= 75);
@@ -399,7 +276,7 @@ async function insertJobs(jobs) {
     const { error } = await supabase.from('applications').insert(
       toQueue.map(j => ({
         job_title: j.job_title, company: j.company, ats_type: j.ats_type,
-        ats_slug: j.ats_slug, external_id: j.external_id, url: j.url,
+        ats_slug: j.ats_slug, external_id: j.url, url: j.url,
         location: j.location || '', status: 'queued', match_score: j.match_score, source: j.source,
       }))
     );
@@ -411,7 +288,7 @@ async function insertJobs(jobs) {
     await supabase.from('applications').insert(
       toArchive.map(j => ({
         job_title: j.job_title, company: j.company, ats_type: j.ats_type,
-        ats_slug: j.ats_slug, external_id: j.external_id, url: j.url,
+        ats_slug: j.ats_slug, external_id: j.url, url: j.url,
         location: j.location || '', status: 'archived', match_score: j.match_score, source: j.source,
       }))
     ).catch(() => {});
@@ -425,21 +302,21 @@ async function insertJobs(jobs) {
 async function main() {
   log('🚀 Starting search-based job discovery with inline scoring...');
 
-  const [adzunaJobs, jsearchJobs, serpApiJobs] = await Promise.allSettled([
-    fetchAdzuna(), fetchJSearch(), fetchSerpApi(),
+  const [adzunaJobs, jsearchJobs, serpApiJobs, siteSearchJobs] = await Promise.allSettled([
+    fetchAdzuna(), fetchJSearch(), fetchSerpApi(), fetchSerpApiSiteSearch(),
   ]).then(results => results.map(r => r.status === 'fulfilled' ? r.value : []));
 
-  const allJobs = [...adzunaJobs, ...jsearchJobs, ...serpApiJobs];
+  const allJobs = [...adzunaJobs, ...jsearchJobs, ...serpApiJobs, ...siteSearchJobs];
   const seen = new Set();
   const uniqueJobs = allJobs.filter(j => {
-    if (!j.external_id || seen.has(j.external_id)) return false;
-    seen.add(j.external_id); return true;
+    if (!j.url || seen.has(j.url)) return false;
+    seen.add(j.url); return true;
   });
 
   log(`\n📊 Scored jobs found: ${uniqueJobs.length}`);
-  log(`   Score 90: ${uniqueJobs.filter(j => j.match_score === 90).length}`);
-  log(`   Score 82: ${uniqueJobs.filter(j => j.match_score === 82).length}`);
-  log(`   Score 78: ${uniqueJobs.filter(j => j.match_score === 78).length}`);
+  log(`   Score 90+: ${uniqueJobs.filter(j => j.match_score >= 90).length}`);
+  log(`   Score 82-89: ${uniqueJobs.filter(j => j.match_score >= 82 && j.match_score < 90).length}`);
+  log(`   Score 75-81: ${uniqueJobs.filter(j => j.match_score >= 75 && j.match_score < 82).length}`);
 
   const { inserted, archived } = await insertJobs(uniqueJobs);
   log(`\n✅ Inserted ${inserted} new jobs into queue`);

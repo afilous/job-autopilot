@@ -4,6 +4,9 @@
  */
 
 const { createClient } = require('@supabase/supabase-js');
+const { scoreJob } = require('./lib/scoring');
+const { SMARTRECRUITERS_SLUGS, fetchSmartRecruitersJobs, WORKABLE_SLUGS, fetchWorkableJobs } = require('./new-ats-fetchers');
+const { fetchAllWorkdayJobs } = require('./workday-fetcher');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
@@ -12,178 +15,10 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── Scoring constants ─────────────────────────────────────────────────────────
-
-// Titles that are an exact target — score 90 immediately
-const TITLE_EXACT_TARGETS = [
-  'strategy & operations', 'strategy and operations', 'strategic operations',
-  'business operations', 'biz ops', 'bizops', 'biz-ops', 'business ops',
-  'revenue operations', 'revops', 'rev ops',
-  'gtm operations', 'gtm ops', 'gtm strategy', 'go-to-market operations',
-  'sales operations', 'sales ops', 'sales strategy and operations',
-  'sales strategy & operations', 'commercial operations',
-  'chief of staff', 'special projects', 'strategic initiatives',
-  'head of operations', 'head of ops', 'strategic planning',
-  'growth operations', 'growth ops', 'growth strategy',
-  'corporate strategy', 'business strategy',
-];
-
-// Titles that score 82 with a qualifying context word
-const TITLE_STRONG_PAIRS = [
-  ['operations', ['strategy', 'business', 'revenue', 'sales', 'gtm', 'growth', 'commercial', 'central', 'general']],
-  ['strategy', ['operations', 'business', 'growth', 'corporate', 'commercial', 'revenue', 'sales', 'gtm']],
-  ['program manager', ['operations', 'strategy', 'ops', 'sales', 'gtm', 'revenue', 'business', 'growth', 'transformation', 'strategic', 'product operations', 'commercial']],
-  ['program director', ['operations', 'strategy', 'ops', 'sales', 'gtm', 'revenue', 'business']],
-];
-
-// Department names that indicate a real ops/strategy role
-const GOOD_DEPARTMENTS = [
-  'strategy', 'operations', 'business operations', 'revenue operations',
-  'sales operations', 'gtm', 'go-to-market', 'growth', 'finance',
-  'strategic finance', 'chief of staff', 'special projects',
-  'business development', 'commercial', 'revenue',
-];
-
-// Department names that disqualify
-const BAD_DEPARTMENTS = [
-  'engineering', 'software', 'product', 'design', 'data science',
-  'machine learning', 'infrastructure', 'security', 'legal', 'hr',
-  'human resources', 'recruiting', 'talent', 'marketing', 'it ',
-  'information technology', 'clinical', 'medical', 'nursing',
-  'facilities', 'supply chain', 'logistics', 'manufacturing',
-];
-
-// Title words that immediately disqualify regardless of other signals
-const TITLE_DISQUALIFIERS = [
-  'software engineer', 'software developer', 'frontend', 'backend', 'full stack',
-  'devops', 'dev ops', 'data engineer', 'data scientist', 'ml engineer',
-  'ai engineer', 'machine learning', 'infrastructure engineer', 'platform engineer',
-  'solutions engineer', 'sales engineer', 'security engineer',
-  'store operations', 'retail operations', 'field operations', 'clinical operations',
-  'warehouse operations', 'manufacturing operations', 'plant operations',
-  'restaurant operations', 'hotel operations', 'fleet operations',
-  'facilities operations', 'distribution operations', 'supply chain operations',
-  'it operations', 'security operations', 'noc ', 'help desk',
-  'account executive', 'account manager', 'sales representative', 'sales rep',
-  'bdr ', 'sdr ', 'inside sales', 'outside sales',
-  'product manager', 'product designer', 'ux ', 'ui ',
-  'data analyst', 'financial analyst', 'accountant', 'controller',
-  'legal counsel', 'attorney', 'paralegal',
-  'recruiter', 'talent acquisition', 'hr business partner',
-  'content writer', 'copywriter', 'graphic designer',
-  'vp ', 'vice president', 'svp', 'evp', 'chief ', 'coo', 'ceo', 'cfo', 'cto',
-];
-
-// Description keywords that suggest a good ops/strategy role
-const GOOD_DESCRIPTION_SIGNALS = [
-  'cross-functional', 'stakeholder', 'p&l', 'okr', 'kpi', 'gtm',
-  'go-to-market', 'revenue operations', 'sales operations', 'business operations',
-  'strategy', 'operational excellence', 'process improvement', 'sql',
-  'data-driven', 'analytics', 'reporting', 'roadmap', 'prioritization',
-  'chief of staff', 'special projects', 'scaled', 'hypergrowth',
-  'cross functional', 'program management', 'project management',
-  'business intelligence', 'tableau', 'salesforce', 'hubspot',
-  'annual planning', 'quarterly planning', 'headcount', 'budget',
-];
-
-// Description keywords that suggest a bad fit
-const BAD_DESCRIPTION_SIGNALS = [
-  'plc', 'cnc', 'forklift', 'warehouse', 'clinical trial', 'patient care',
-  'nursing', 'hospital', 'icu', 'medical device', 'retail store',
-  'store manager', 'district manager', 'field technician', 'field service',
-  'manufacturing plant', 'production line', 'assembly line',
-  'truck', 'driver', 'fleet management', 'route optimization',
-  'customer service representative', 'call center',
-];
-
-// Location filters
-const EXCLUDE_LOCATIONS = [
-  'london', 'united kingdom', ' uk,', ' uk ', 'emea', 'germany', 'france',
-  'canada', 'toronto', 'vancouver', 'montreal', 'ontario', 'british columbia',
-  'australia', 'singapore', 'india', 'apac', 'japan', 'mexico',
-  'brazil', 'argentina', 'chile', 'bangalore', 'chennai', 'gurugram',
-];
-
-const REMOTE_SIGNALS = [
-  'remote', 'anywhere', 'distributed', 'work from home', 'wfh',
-  'us remote', 'usa remote', 'united states remote', 'north america remote', 'nationwide',
-];
-
-const BAY_AREA_SIGNALS = [
-  'san francisco', 'sf,', ' sf ', 'bay area', 'palo alto', 'mountain view',
-  'menlo park', 'san mateo', 'foster city', 'redwood city', 'sunnyvale',
-  'santa clara', 'cupertino', 'campbell', 'san jose', 'oakland', 'berkeley',
-  'burlingame', 'south san francisco', 'milpitas', 'fremont', 'pleasanton',
-  'walnut creek', 'silicon valley', 'peninsula', 'emeryville', 'redwood shores',
-];
-
-// ── Scoring engine ────────────────────────────────────────────────────────────
-
-function scoreJob({ title, department, description, location, company }) {
-  const t = (title || '').toLowerCase();
-  const dept = (department || '').toLowerCase();
-  const desc = (description || '').toLowerCase();
-  const loc = (location || '').toLowerCase();
-
-  // 1. Location filter — disqualify non-US/remote immediately
-  if (EXCLUDE_LOCATIONS.some(k => loc.includes(k))) return 0;
-  const isRemote = REMOTE_SIGNALS.some(k => loc.includes(k));
-  const isBayArea = BAY_AREA_SIGNALS.some(k => loc.includes(k));
-  const noLocation = !loc || loc.length < 2;
-  if (!isRemote && !isBayArea && !noLocation) return 0;
-
-  // 2. Title disqualifiers — archive immediately
-  if (TITLE_DISQUALIFIERS.some(k => t.includes(k))) return 0;
-
-  // 3. Department disqualifiers
-  if (BAD_DEPARTMENTS.some(k => dept.includes(k))) return 0;
-
-  // 4. Description bad signals (only if description is substantial)
-  if (desc.length > 200) {
-    const badCount = BAD_DESCRIPTION_SIGNALS.filter(k => desc.includes(k)).length;
-    if (badCount >= 2) return 0;
-  }
-
-  // 5. Exact title match — score 90
-  if (TITLE_EXACT_TARGETS.some(k => t.includes(k))) return 90;
-
-  // 6. Good department + any ops/strategy in title — score 85
-  const hasGoodDept = GOOD_DEPARTMENTS.some(k => dept.includes(k));
-  if (hasGoodDept && (t.includes('operations') || t.includes('strategy') || t.includes('program manager'))) {
-    return 85;
-  }
-
-  // 7. Strong title pairs — score 82
-  for (const [primary, qualifiers] of TITLE_STRONG_PAIRS) {
-    if (t.includes(primary) && qualifiers.some(q => t.includes(q))) return 82;
-  }
-
-  // 8. Ambiguous title — check description for signals
-  const isAmbiguous = t.includes('operations manager') || t.includes('program manager') ||
-    t.includes('operations lead') || t.includes('strategy manager');
-
-  if (isAmbiguous && desc.length > 200) {
-    const goodCount = GOOD_DESCRIPTION_SIGNALS.filter(k => desc.includes(k)).length;
-    if (goodCount >= 4) return 82;
-    if (goodCount >= 2) return 78;
-    return 0; // Ambiguous title + weak description = archive
-  }
-
-  // 9. Standalone "operations manager" or "strategy manager" without qualifiers
-  // Only keep if from a known tech company list (covered by slug lists)
-  if (t.includes('operations manager') || t.includes('operations lead') ||
-      t.includes('operations director') || t.includes('strategy manager') ||
-      t.includes('strategy lead')) {
-    return 78; // From known tech company slugs, give benefit of doubt
-  }
-
-  // 10. Weak match — archive
-  return 0;
-}
-
 // ── ATS URL patterns ──────────────────────────────────────────────────────────
 
-// ── Greenhouse companies ──────────────────────────────────────────────────────
+// ── Greenhouse companies (hardcoded floor — Supabase-discovered companies are
+// unioned with this list at runtime, see buildCompanyLists()) ────────────────
 const GREENHOUSE_SLUGS = [
   'airbnb', 'lyft', 'doordash', 'instacart', 'openai', 'anthropic',
   'stripe', 'notion', 'figma', 'intercom', 'verkada', 'rippling',
@@ -219,7 +54,7 @@ const GREENHOUSE_SLUGS = [
   'dbt', 'fivetran', 'airbyte', 'stitch',
 ];
 
-// ── Ashby companies ───────────────────────────────────────────────────────────
+// ── Ashby companies (hardcoded floor) ─────────────────────────────────────────
 const ASHBY_SLUGS = [
   'ramp', 'linear', 'airwallex', 'vercel', 'descript', 'watershed',
   'hightouch', 'metabase', 'posthog', 'hex', 'census', 'webflow',
@@ -244,7 +79,7 @@ const ASHBY_SLUGS = [
   'ashbyhq', 'greenhouse', 'lever', 'workable',
 ];
 
-// ── Lever companies ───────────────────────────────────────────────────────────
+// ── Lever companies (hardcoded floor) ─────────────────────────────────────────
 const LEVER_SLUGS = [
   'plaid', 'rover', 'canarytechnologies', 'filevine', 'udemy',
   'coursera', 'duolingo', 'handshake', 'olo', 'lime', 'walkme',
@@ -450,6 +285,33 @@ async function fetchYCCompanies() {
   } catch(e) { return { greenhouse: [], ashby: [], lever: [] }; }
 }
 
+// ── NEW: pull companies discover-companies.js has already found in Supabase ──
+
+async function fetchCompaniesFromSupabase(atsType) {
+  // Supabase default select() caps at 1000 rows -- page through with .range()
+  const PAGE_SIZE = 1000;
+  let allSlugs = [];
+  let from = 0;
+
+  while (true) {
+    const { data, error } = await supabase
+      .from('companies')
+      .select('ats_slug')
+      .eq('ats_type', atsType)
+      .eq('active', true)
+      .range(from, from + PAGE_SIZE - 1);
+
+    if (error) { log(`  ⚠ Supabase fetch error (${atsType}): ${error.message}`); break; }
+    if (!data || data.length === 0) break;
+
+    allSlugs.push(...data.map(row => row.ats_slug));
+    if (data.length < PAGE_SIZE) break;
+    from += PAGE_SIZE;
+  }
+
+  return allSlugs;
+}
+
 // ── Insert jobs ───────────────────────────────────────────────────────────────
 
 async function insertJobs(jobs) {
@@ -534,24 +396,40 @@ async function processBatch(slugs, fetchFn, label, batchDelay = 300) {
 
 async function main() {
   log('🚀 Starting API-based job discovery with inline scoring...');
-  log(`   Greenhouse: ${GREENHOUSE_SLUGS.length} companies`);
-  log(`   Ashby:      ${ASHBY_SLUGS.length} companies`);
-  log(`   Lever:      ${LEVER_SLUGS.length} companies`);
 
   log('🔍 Fetching YC company job boards...');
   const ycSlugs = await fetchYCCompanies();
 
-  const allGHSlugs = [...new Set([...GREENHOUSE_SLUGS, ...ycSlugs.greenhouse])];
-  const allABSlugs = [...new Set([...ASHBY_SLUGS, ...ycSlugs.ashby])];
-  const allLVSlugs = [...new Set([...LEVER_SLUGS, ...ycSlugs.lever])];
+  log('🔍 Fetching discovered companies from Supabase (populated by discover-companies.js)...');
+  const [dbGH, dbAB, dbLV, dbSR, dbWK] = await Promise.all([
+    fetchCompaniesFromSupabase('greenhouse'),
+    fetchCompaniesFromSupabase('ashby'),
+    fetchCompaniesFromSupabase('lever'),
+    fetchCompaniesFromSupabase('smartrecruiters'),
+    fetchCompaniesFromSupabase('workable'),
+  ]);
+  log(`  📋 Supabase: ${dbGH.length} GH, ${dbAB.length} Ashby, ${dbLV.length} Lever, ` +
+      `${dbSR.length} SmartRecruiters, ${dbWK.length} Workable`);
 
-  log(`📋 Total: ${allGHSlugs.length} GH, ${allABSlugs.length} Ashby, ${allLVSlugs.length} Lever`);
+  const allGHSlugs = [...new Set([...GREENHOUSE_SLUGS, ...ycSlugs.greenhouse, ...dbGH])];
+  const allABSlugs = [...new Set([...ASHBY_SLUGS, ...ycSlugs.ashby, ...dbAB])];
+  const allLVSlugs = [...new Set([...LEVER_SLUGS, ...ycSlugs.lever, ...dbLV])];
+  const allSRSlugs = [...new Set([...SMARTRECRUITERS_SLUGS, ...dbSR])];
+  const allWKSlugs = [...new Set([...WORKABLE_SLUGS, ...dbWK])];
+
+  log(`📋 Total to check: ${allGHSlugs.length} GH, ${allABSlugs.length} Ashby, ${allLVSlugs.length} Lever, ` +
+      `${allSRSlugs.length} SmartRecruiters, ${allWKSlugs.length} Workable`);
 
   const ghJobs = await processBatch(allGHSlugs, fetchGreenhouseJobs, 'Greenhouse');
   const abJobs = await processBatch(allABSlugs, fetchAshbyJobs, 'Ashby', 1200);
   const lvJobs = await processBatch(allLVSlugs, fetchLeverJobs, 'Lever', 1000);
+  const srJobs = await processBatch(allSRSlugs, slug => fetchSmartRecruitersJobs(slug, scoreJob), 'SmartRecruiters', 500);
+  const wkJobs = await processBatch(allWKSlugs, slug => fetchWorkableJobs(slug, scoreJob), 'Workable', 500);
 
-  const allJobs = [...ghJobs, ...abJobs, ...lvJobs];
+  log('🔍 Workday tenants...');
+  const wdJobs = await fetchAllWorkdayJobs(scoreJob);
+
+  const allJobs = [...ghJobs, ...abJobs, ...lvJobs, ...srJobs, ...wkJobs, ...wdJobs];
 
   // Deduplicate by external_id
   const seen = new Set();
@@ -562,11 +440,10 @@ async function main() {
   });
 
   log(`\n📊 Scored jobs found:`);
-  log(`   Score 90 (exact match): ${uniqueJobs.filter(j => j.match_score === 90).length}`);
-  log(`   Score 85 (dept match):  ${uniqueJobs.filter(j => j.match_score === 85).length}`);
-  log(`   Score 82 (strong pair): ${uniqueJobs.filter(j => j.match_score === 82).length}`);
-  log(`   Score 78 (ambiguous):   ${uniqueJobs.filter(j => j.match_score === 78).length}`);
-  log(`   Total queued (75+):     ${uniqueJobs.filter(j => j.match_score >= 75).length}`);
+  log(`   Score 90+ (exact/CoS/HoO): ${uniqueJobs.filter(j => j.match_score >= 90).length}`);
+  log(`   Score 82-89:                ${uniqueJobs.filter(j => j.match_score >= 82 && j.match_score < 90).length}`);
+  log(`   Score 78-81 (ambiguous):    ${uniqueJobs.filter(j => j.match_score >= 78 && j.match_score < 82).length}`);
+  log(`   Total queued (75+):         ${uniqueJobs.filter(j => j.match_score >= 75).length}`);
 
   const { inserted, archived } = await insertJobs(uniqueJobs);
   log(`\n✅ Inserted ${inserted} new jobs into queue`);

@@ -19,7 +19,7 @@ jobs:
   discover-api:
     name: Discover via ATS APIs (free, no key needed)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25   # was 15 — bumped for the 3 new sources (SmartRecruiters, Workable, Workday)
     if: ${{ github.event.inputs.method != 'search-only' }}
 
     steps:

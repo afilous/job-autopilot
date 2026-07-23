@@ -14,6 +14,11 @@ on:
           - both
           - api-only
           - search-only
+      enable_site_search:
+        description: 'Run the SerpApi site: search too? Costs 28 extra calls — see cost note in discover-jobs.js. Leave false on the free plan unless you mean to use it.'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   discover-api:
@@ -57,4 +62,8 @@ jobs:
           ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
           JSEARCH_API_KEY: ${{ secrets.JSEARCH_API_KEY }}
           SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          # On the scheduled (cron) run there's no workflow_dispatch input,
+          # so this defaults to unset/false — the expensive site search only
+          # runs when someone deliberately triggers it manually with the box checked.
+          ENABLE_SITE_SEARCH: ${{ github.event.inputs.enable_site_search || 'false' }}
         run: node discover-jobs.js

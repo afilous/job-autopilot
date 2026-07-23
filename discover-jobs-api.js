@@ -15,8 +15,6 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── ATS URL patterns ──────────────────────────────────────────────────────────
-
 // ── Greenhouse companies (hardcoded floor — Supabase-discovered companies are
 // unioned with this list at runtime, see buildCompanyLists()) ────────────────
 const GREENHOUSE_SLUGS = [
@@ -141,10 +139,8 @@ async function fetchGreenhouseJobs(slug) {
       const location = j.location?.name || '';
       const department = j.departments?.[0]?.name || '';
 
-      // Quick score without description first
       let score = scoreJob({ title, department, description: '', location, company: slug });
 
-      // For ambiguous titles, fetch full content
       if (score === 78 || score === 82) {
         const needsContent = title.toLowerCase().includes('program manager') ||
           title.toLowerCase().includes('operations manager') ||
@@ -152,7 +148,7 @@ async function fetchGreenhouseJobs(slug) {
         if (needsContent) {
           const content = await fetchGreenhouseJobWithContent(slug, j.id);
           score = scoreJob({ title, department, description: content, location, company: slug });
-          await sleep(200); // Rate limit
+          await sleep(200);
         }
       }
 
@@ -285,10 +281,9 @@ async function fetchYCCompanies() {
   } catch(e) { return { greenhouse: [], ashby: [], lever: [] }; }
 }
 
-// ── NEW: pull companies discover-companies.js has already found in Supabase ──
+// ── Pull companies (and Workday tenants) discover-companies.js has found ─────
 
 async function fetchCompaniesFromSupabase(atsType) {
-  // Supabase default select() caps at 1000 rows -- page through with .range()
   const PAGE_SIZE = 1000;
   let allSlugs = [];
   let from = 0;
@@ -312,6 +307,31 @@ async function fetchCompaniesFromSupabase(atsType) {
   return allSlugs;
 }
 
+async function fetchWorkdayTenantsFromSupabase() {
+  const PAGE_SIZE = 1000;
+  let allTenants = [];
+  let from = 0;
+
+  while (true) {
+    const { data, error } = await supabase
+      .from('workday_tenants')
+      .select('company, tenant, wd_server, site')
+      .eq('active', true)
+      .range(from, from + PAGE_SIZE - 1);
+
+    if (error) { log(`  ⚠ Supabase fetch error (workday_tenants): ${error.message}`); break; }
+    if (!data || data.length === 0) break;
+
+    allTenants.push(...data.map(row => ({
+      company: row.company, tenant: row.tenant, wdServer: row.wd_server, site: row.site,
+    })));
+    if (data.length < PAGE_SIZE) break;
+    from += PAGE_SIZE;
+  }
+
+  return allTenants;
+}
+
 // ── Insert jobs ───────────────────────────────────────────────────────────────
 
 async function insertJobs(jobs) {
@@ -328,7 +348,6 @@ async function insertJobs(jobs) {
 
   if (newJobs.length === 0) return { inserted: 0, archived: 0 };
 
-  // Split into queued (score >= 75) and archived (score < 75 but > 0)
   const toQueue = newJobs.filter(j => j.match_score >= 75);
   const toArchive = newJobs.filter(j => j.match_score > 0 && j.match_score < 75);
 
@@ -352,7 +371,6 @@ async function insertJobs(jobs) {
     else log(`  ❌ Insert error: ${error.message}`);
   }
 
-  // Archive low-score jobs so they don't get re-discovered
   if (toArchive.length > 0) {
     await supabase.from('applications').insert(
       toArchive.map(j => ({
@@ -401,15 +419,16 @@ async function main() {
   const ycSlugs = await fetchYCCompanies();
 
   log('🔍 Fetching discovered companies from Supabase (populated by discover-companies.js)...');
-  const [dbGH, dbAB, dbLV, dbSR, dbWK] = await Promise.all([
+  const [dbGH, dbAB, dbLV, dbSR, dbWK, dbWorkdayTenants] = await Promise.all([
     fetchCompaniesFromSupabase('greenhouse'),
     fetchCompaniesFromSupabase('ashby'),
     fetchCompaniesFromSupabase('lever'),
     fetchCompaniesFromSupabase('smartrecruiters'),
     fetchCompaniesFromSupabase('workable'),
+    fetchWorkdayTenantsFromSupabase(),
   ]);
   log(`  📋 Supabase: ${dbGH.length} GH, ${dbAB.length} Ashby, ${dbLV.length} Lever, ` +
-      `${dbSR.length} SmartRecruiters, ${dbWK.length} Workable`);
+      `${dbSR.length} SmartRecruiters, ${dbWK.length} Workable, ${dbWorkdayTenants.length} Workday tenants`);
 
   const allGHSlugs = [...new Set([...GREENHOUSE_SLUGS, ...ycSlugs.greenhouse, ...dbGH])];
   const allABSlugs = [...new Set([...ASHBY_SLUGS, ...ycSlugs.ashby, ...dbAB])];
@@ -427,11 +446,10 @@ async function main() {
   const wkJobs = await processBatch(allWKSlugs, slug => fetchWorkableJobs(slug, scoreJob), 'Workable', 500);
 
   log('🔍 Workday tenants...');
-  const wdJobs = await fetchAllWorkdayJobs(scoreJob);
+  const wdJobs = await fetchAllWorkdayJobs(scoreJob, dbWorkdayTenants);
 
   const allJobs = [...ghJobs, ...abJobs, ...lvJobs, ...srJobs, ...wkJobs, ...wdJobs];
 
-  // Deduplicate by external_id
   const seen = new Set();
   const uniqueJobs = allJobs.filter(j => {
     if (!j.external_id || seen.has(j.external_id)) return false;

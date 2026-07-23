@@ -1,6 +1,6 @@
 /**
  * Job Autopilot — Search-based Job Discovery
- * Sources: Adzuna + JSearch + SerpApi (+ SerpApi site: search)
+ * Sources: Adzuna + JSearch + SerpApi (+ optional SerpApi site: search)
  * Scores jobs at insert time using the shared engine in lib/scoring.js
  */
 
@@ -15,15 +15,22 @@ const ADZUNA_APP_KEY = process.env.ADZUNA_APP_KEY;
 const JSEARCH_API_KEY = process.env.JSEARCH_API_KEY;
 const SERPAPI_KEY = process.env.SERPAPI_KEY;
 
+// COST GATE: the site: search adds 28 SerpApi calls per run (7 domains x 4
+// title groups). On SerpApi's free plan (250 searches/month, 50/hour cap),
+// combined with the 4 calls/day fetchSerpApi() already uses, running this
+// daily would consume ~960 searches/month -- nearly 4x the entire free
+// monthly allowance, exhausted in about 8 days. Defaults to OFF. Set
+// ENABLE_SITE_SEARCH=true as a workflow input/env var only on runs where
+// you deliberately want it (e.g. a manual, occasional trigger), not on the
+// daily schedule, until you're on a paid plan with headroom for it.
+const ENABLE_SITE_SEARCH = process.env.ENABLE_SITE_SEARCH === 'true';
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ── Generic ATS URL parsing ───────────────────────────────────────────────────
-// Replaces the old ATS_PATTERNS regex array, which only recognized Greenhouse/
-// Lever/Ashby URLs and silently dropped everything else (Workday,
-// SmartRecruiters, Workable, etc.) even when the job itself was a great match.
 
 function parseJobUrl(url) {
   if (!looksLikeJobUrl(url)) return null;
@@ -153,6 +160,7 @@ async function fetchJSearch() {
 }
 
 // ── SerpApi (google_jobs — structured job listings) ───────────────────────────
+// 4 calls/day = ~120/month on its own -- roughly half the free plan's 250/month.
 
 async function fetchSerpApi() {
   if (!SERPAPI_KEY) { log('⏭ SerpApi: no credentials'); return []; }
@@ -197,11 +205,9 @@ async function fetchSerpApi() {
   return jobs;
 }
 
-// ── NEW: SerpApi site:-restricted search across ATS platforms ────────────────
+// ── SerpApi site:-restricted search across ATS platforms (GATED — see ENABLE_SITE_SEARCH above) ──
 // Uses the `google` engine (not `google_jobs`) so the site: operator works.
-// Verified this session: a single query per domain surfaces companies never
-// in the hardcoded slug lists (8+ new companies each on Ashby and Greenhouse
-// from one query apiece).
+// 28 calls/run. On the free plan, do NOT run this daily -- see cost note above.
 
 const ATS_SITE_DOMAINS = [
   'jobs.ashbyhq.com', 'boards.greenhouse.io', 'job-boards.greenhouse.io',
@@ -217,6 +223,10 @@ const SITE_SEARCH_TITLE_GROUPS = [
 
 async function fetchSerpApiSiteSearch() {
   if (!SERPAPI_KEY) { log('⏭ SerpApi site search: no credentials'); return []; }
+  if (!ENABLE_SITE_SEARCH) {
+    log('⏭ SerpApi site search: disabled (set ENABLE_SITE_SEARCH=true to run — costs 28 calls, see cost note in file header)');
+    return [];
+  }
   log('🔍 SerpApi: site-restricted search...');
   const jobs = [];
 
@@ -253,11 +263,6 @@ async function fetchSerpApiSiteSearch() {
 }
 
 // ── Insert jobs ───────────────────────────────────────────────────────────────
-// Dedupe on `url` instead of `external_id` -- the generic parseJobUrl() doesn't
-// extract a clean external_id the way the old Greenhouse/Lever/Ashby-only
-// regex did, so url is now the reliable unique key across all sources.
-// Requires a DB-level unique constraint on applications.url for this to be
-// fully race-safe: ALTER TABLE applications ADD CONSTRAINT applications_url_unique UNIQUE (url);
 
 async function insertJobs(jobs) {
   if (jobs.length === 0) return { inserted: 0, archived: 0 };
@@ -301,6 +306,9 @@ async function insertJobs(jobs) {
 
 async function main() {
   log('🚀 Starting search-based job discovery with inline scoring...');
+  log(ENABLE_SITE_SEARCH
+    ? '⚠ ENABLE_SITE_SEARCH=true — running the 28-call site search this run'
+    : 'ℹ Site search disabled by default (ENABLE_SITE_SEARCH not set to true)');
 
   const [adzunaJobs, jsearchJobs, serpApiJobs, siteSearchJobs] = await Promise.allSettled([
     fetchAdzuna(), fetchJSearch(), fetchSerpApi(), fetchSerpApiSiteSearch(),

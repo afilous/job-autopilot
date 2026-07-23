@@ -19,10 +19,8 @@ const SERPAPI_KEY = process.env.SERPAPI_KEY;
 // title groups). On SerpApi's free plan (250 searches/month, 50/hour cap),
 // combined with the 4 calls/day fetchSerpApi() already uses, running this
 // daily would consume ~960 searches/month -- nearly 4x the entire free
-// monthly allowance, exhausted in about 8 days. Defaults to OFF. Set
-// ENABLE_SITE_SEARCH=true as a workflow input/env var only on runs where
-// you deliberately want it (e.g. a manual, occasional trigger), not on the
-// daily schedule, until you're on a paid plan with headroom for it.
+// monthly allowance. Defaults to OFF. Set ENABLE_SITE_SEARCH=true as a
+// workflow input only on runs where you deliberately want it.
 const ENABLE_SITE_SEARCH = process.env.ENABLE_SITE_SEARCH === 'true';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
@@ -160,7 +158,6 @@ async function fetchJSearch() {
 }
 
 // ── SerpApi (google_jobs — structured job listings) ───────────────────────────
-// 4 calls/day = ~120/month on its own -- roughly half the free plan's 250/month.
 
 async function fetchSerpApi() {
   if (!SERPAPI_KEY) { log('⏭ SerpApi: no credentials'); return []; }
@@ -205,9 +202,7 @@ async function fetchSerpApi() {
   return jobs;
 }
 
-// ── SerpApi site:-restricted search across ATS platforms (GATED — see ENABLE_SITE_SEARCH above) ──
-// Uses the `google` engine (not `google_jobs`) so the site: operator works.
-// 28 calls/run. On the free plan, do NOT run this daily -- see cost note above.
+// ── SerpApi site:-restricted search (GATED — see ENABLE_SITE_SEARCH above) ──
 
 const ATS_SITE_DOMAINS = [
   'jobs.ashbyhq.com', 'boards.greenhouse.io', 'job-boards.greenhouse.io',
@@ -224,7 +219,7 @@ const SITE_SEARCH_TITLE_GROUPS = [
 async function fetchSerpApiSiteSearch() {
   if (!SERPAPI_KEY) { log('⏭ SerpApi site search: no credentials'); return []; }
   if (!ENABLE_SITE_SEARCH) {
-    log('⏭ SerpApi site search: disabled (set ENABLE_SITE_SEARCH=true to run — costs 28 calls, see cost note in file header)');
+    log('⏭ SerpApi site search: disabled (set ENABLE_SITE_SEARCH=true to run)');
     return [];
   }
   log('🔍 SerpApi: site-restricted search...');
@@ -263,6 +258,10 @@ async function fetchSerpApiSiteSearch() {
 }
 
 // ── Insert jobs ───────────────────────────────────────────────────────────────
+// FIXED (same bug as discover-jobs-api.js): insert() -> upsert(..., { onConflict:
+// 'url', ignoreDuplicates: true }), so a single URL collision doesn't fail the
+// whole batch. Also removed an invalid `.catch()` chained directly onto a
+// Supabase query builder call, which threw "catch is not a function".
 
 async function insertJobs(jobs) {
   if (jobs.length === 0) return { inserted: 0, archived: 0 };
@@ -278,28 +277,33 @@ async function insertJobs(jobs) {
 
   let inserted = 0;
   if (toQueue.length > 0) {
-    const { error } = await supabase.from('applications').insert(
+    const { data, error } = await supabase.from('applications').upsert(
       toQueue.map(j => ({
         job_title: j.job_title, company: j.company, ats_type: j.ats_type,
         ats_slug: j.ats_slug, external_id: j.url, url: j.url,
         location: j.location || '', status: 'queued', match_score: j.match_score, source: j.source,
-      }))
-    );
-    if (!error) inserted = toQueue.length;
-    else log(`  ❌ Insert error: ${error.message}`);
+      })),
+      { onConflict: 'url', ignoreDuplicates: true }
+    ).select();
+    if (error) log(`  ❌ Insert error (queue): ${error.message}`);
+    else inserted = (data || []).length;
   }
 
+  let archived = 0;
   if (toArchive.length > 0) {
-    await supabase.from('applications').insert(
+    const { data, error } = await supabase.from('applications').upsert(
       toArchive.map(j => ({
         job_title: j.job_title, company: j.company, ats_type: j.ats_type,
         ats_slug: j.ats_slug, external_id: j.url, url: j.url,
         location: j.location || '', status: 'archived', match_score: j.match_score, source: j.source,
-      }))
-    ).catch(() => {});
+      })),
+      { onConflict: 'url', ignoreDuplicates: true }
+    ).select();
+    if (error) log(`  ❌ Insert error (archive): ${error.message}`);
+    else archived = (data || []).length;
   }
 
-  return { inserted, archived: toArchive.length };
+  return { inserted, archived };
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────

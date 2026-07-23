@@ -15,8 +15,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── Greenhouse companies (hardcoded floor — Supabase-discovered companies are
-// unioned with this list at runtime, see buildCompanyLists()) ────────────────
+// ── Greenhouse companies (hardcoded floor) ────────────────────────────────────
 const GREENHOUSE_SLUGS = [
   'airbnb', 'lyft', 'doordash', 'instacart', 'openai', 'anthropic',
   'stripe', 'notion', 'figma', 'intercom', 'verkada', 'rippling',
@@ -333,6 +332,16 @@ async function fetchWorkdayTenantsFromSupabase() {
 }
 
 // ── Insert jobs ───────────────────────────────────────────────────────────────
+// FIXED: switched insert() -> upsert(..., { onConflict: 'url', ignoreDuplicates: true }).
+// Root cause of the crash this was fixing: applications.url now has a unique
+// constraint, but insert() fails the ENTIRE batch if even one row collides --
+// Postgres doesn't skip just the bad row. upsert+ignoreDuplicates skips
+// colliding rows gracefully instead, same pattern insertCompanies() already
+// uses successfully in discover-companies.js.
+// ALSO FIXED: removed a `.catch(() => {})` chained directly onto a Supabase
+// query builder call -- this throws "catch is not a function" because
+// Supabase's builder isn't a real Promise until awaited. Destructure
+// { error } and check it instead, per the documented project gotcha.
 
 async function insertJobs(jobs) {
   if (jobs.length === 0) return { inserted: 0, archived: 0 };
@@ -353,7 +362,7 @@ async function insertJobs(jobs) {
 
   let inserted = 0;
   if (toQueue.length > 0) {
-    const { error } = await supabase.from('applications').insert(
+    const { data, error } = await supabase.from('applications').upsert(
       toQueue.map(j => ({
         job_title: j.job_title,
         company: j.company,
@@ -365,14 +374,16 @@ async function insertJobs(jobs) {
         status: 'queued',
         match_score: j.match_score,
         source: j.source,
-      }))
-    );
-    if (!error) inserted = toQueue.length;
-    else log(`  ❌ Insert error: ${error.message}`);
+      })),
+      { onConflict: 'url', ignoreDuplicates: true }
+    ).select();
+    if (error) log(`  ❌ Insert error (queue): ${error.message}`);
+    else inserted = (data || []).length; // ignoreDuplicates means skipped rows aren't returned/counted
   }
 
+  let archived = 0;
   if (toArchive.length > 0) {
-    await supabase.from('applications').insert(
+    const { data, error } = await supabase.from('applications').upsert(
       toArchive.map(j => ({
         job_title: j.job_title,
         company: j.company,
@@ -384,11 +395,14 @@ async function insertJobs(jobs) {
         status: 'archived',
         match_score: j.match_score,
         source: j.source,
-      }))
-    ).catch(() => {});
+      })),
+      { onConflict: 'url', ignoreDuplicates: true }
+    ).select();
+    if (error) log(`  ❌ Insert error (archive): ${error.message}`);
+    else archived = (data || []).length;
   }
 
-  return { inserted, archived: toArchive.length };
+  return { inserted, archived };
 }
 
 // ── Process slugs in parallel batches ────────────────────────────────────────

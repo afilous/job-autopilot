@@ -1,8 +1,8 @@
-name: Job Autopilot — Discover Jobs
+name: Job Autopilot - Discover Jobs
 
 on:
   schedule:
-    - cron: '0 16 * * 1-5'   # weekdays only, ~16:00 UTC / 9am PT
+    - cron: "0 16 * * 1-5"
   workflow_dispatch:
     inputs:
       method:
@@ -15,7 +15,7 @@ on:
           - api-only
           - search-only
       enable_site_search:
-        description: 'Run the SerpApi site: search too? Costs 28 extra calls — see cost note in discover-jobs.js. Leave false on the free plan unless you mean to use it.'
+        description: 'Run the SerpApi site: search too? Costs 28 extra calls - see cost note in discover-jobs.js. Leave false on the free plan unless you mean to use it.'
         required: false
         default: false
         type: boolean
@@ -24,14 +24,14 @@ jobs:
   discover-api:
     name: Discover via ATS APIs (free, no key needed)
     runs-on: ubuntu-latest
-    timeout-minutes: 25   # was 15 — bumped for the 3 new sources (SmartRecruiters, Workable, Workday)
+    timeout-minutes: 25
     if: ${{ github.event.inputs.method != 'search-only' }}
 
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: "24"
       - run: npm install
 
       - name: Run API discovery
@@ -46,13 +46,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     if: ${{ github.event.inputs.method != 'api-only' }}
-    needs: discover-api  # run after API discovery so we can compare
+    needs: discover-api
 
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: "24"
       - run: npm install
 
       - name: Run search discovery
@@ -63,8 +63,5 @@ jobs:
           ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
           JSEARCH_API_KEY: ${{ secrets.JSEARCH_API_KEY }}
           SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
-          # On the scheduled (cron) run there's no workflow_dispatch input,
-          # so this defaults to unset/false — the expensive site search only
-          # runs when someone deliberately triggers it manually with the box checked.
           ENABLE_SITE_SEARCH: ${{ github.event.inputs.enable_site_search || 'false' }}
         run: node discover-jobs.js

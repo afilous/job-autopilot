@@ -1,0 +1,26 @@
+name: Job Autopilot - Discover Jobs (Workday)
+
+on:
+  schedule:
+    - cron: "30 16 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  discover-workday:
+    name: Discover via Workday tenants
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: npm install
+
+      - name: Run Workday-only discovery
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          DISCOVERY_MODE: workday-only
+        run: node discover-jobs-api.js

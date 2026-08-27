@@ -427,10 +427,8 @@ async function processBatch(slugs, fetchFn, label, batchDelay = 300) {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
-  log('🚀 Starting API-based job discovery with inline scoring...');
-
-  log('🔍 Fetching YC company job boards...');
-  const ycSlugs = await fetchYCCompanies();
+  const MODE = process.env.DISCOVERY_MODE || 'both'; // 'ats-boards-only' | 'workday-only' | 'both'
+  log(`🚀 Starting API-based job discovery with inline scoring... (mode: ${MODE})`);
 
   log('🔍 Fetching discovered companies from Supabase (populated by discover-companies.js)...');
   const [dbGH, dbAB, dbLV, dbSR, dbWK, dbWorkdayTenants] = await Promise.all([
@@ -444,23 +442,37 @@ async function main() {
   log(`  📋 Supabase: ${dbGH.length} GH, ${dbAB.length} Ashby, ${dbLV.length} Lever, ` +
       `${dbSR.length} SmartRecruiters, ${dbWK.length} Workable, ${dbWorkdayTenants.length} Workday tenants`);
 
-  const allGHSlugs = [...new Set([...GREENHOUSE_SLUGS, ...ycSlugs.greenhouse, ...dbGH])];
-  const allABSlugs = [...new Set([...ASHBY_SLUGS, ...ycSlugs.ashby, ...dbAB])];
-  const allLVSlugs = [...new Set([...LEVER_SLUGS, ...ycSlugs.lever, ...dbLV])];
-  const allSRSlugs = [...new Set([...SMARTRECRUITERS_SLUGS, ...dbSR])];
-  const allWKSlugs = [...new Set([...WORKABLE_SLUGS, ...dbWK])];
+  let ghJobs = [], abJobs = [], lvJobs = [], srJobs = [], wkJobs = [];
 
-  log(`📋 Total to check: ${allGHSlugs.length} GH, ${allABSlugs.length} Ashby, ${allLVSlugs.length} Lever, ` +
-      `${allSRSlugs.length} SmartRecruiters, ${allWKSlugs.length} Workable`);
+  if (MODE !== 'workday-only') {
+    log('🔍 Fetching YC company job boards...');
+    const ycSlugs = await fetchYCCompanies();
 
-  const ghJobs = await processBatch(allGHSlugs, fetchGreenhouseJobs, 'Greenhouse');
-  const abJobs = await processBatch(allABSlugs, fetchAshbyJobs, 'Ashby', 1200);
-  const lvJobs = await processBatch(allLVSlugs, fetchLeverJobs, 'Lever', 1000);
-  const srJobs = await processBatch(allSRSlugs, slug => fetchSmartRecruitersJobs(slug, scoreJob), 'SmartRecruiters', 500);
-  const wkJobs = await processBatch(allWKSlugs, slug => fetchWorkableJobs(slug, scoreJob), 'Workable', 500);
+    const allGHSlugs = [...new Set([...GREENHOUSE_SLUGS, ...ycSlugs.greenhouse, ...dbGH])];
+    const allABSlugs = [...new Set([...ASHBY_SLUGS, ...ycSlugs.ashby, ...dbAB])];
+    const allLVSlugs = [...new Set([...LEVER_SLUGS, ...ycSlugs.lever, ...dbLV])];
+    const allSRSlugs = [...new Set([...SMARTRECRUITERS_SLUGS, ...dbSR])];
+    const allWKSlugs = [...new Set([...WORKABLE_SLUGS, ...dbWK])];
 
-  log('🔍 Workday tenants...');
-  const wdJobs = await fetchAllWorkdayJobs(scoreJob, dbWorkdayTenants);
+    log(`📋 Total to check: ${allGHSlugs.length} GH, ${allABSlugs.length} Ashby, ${allLVSlugs.length} Lever, ` +
+        `${allSRSlugs.length} SmartRecruiters, ${allWKSlugs.length} Workable`);
+
+    ghJobs = await processBatch(allGHSlugs, fetchGreenhouseJobs, 'Greenhouse');
+    abJobs = await processBatch(allABSlugs, fetchAshbyJobs, 'Ashby', 1200);
+    lvJobs = await processBatch(allLVSlugs, fetchLeverJobs, 'Lever', 1000);
+    srJobs = await processBatch(allSRSlugs, slug => fetchSmartRecruitersJobs(slug, scoreJob), 'SmartRecruiters', 500);
+    wkJobs = await processBatch(allWKSlugs, slug => fetchWorkableJobs(slug, scoreJob), 'Workable', 500);
+  } else {
+    log('⏭ Skipping ATS boards (mode: workday-only)');
+  }
+
+  let wdJobs = [];
+  if (MODE !== 'ats-boards-only') {
+    log('🔍 Workday tenants...');
+    wdJobs = await fetchAllWorkdayJobs(scoreJob, dbWorkdayTenants);
+  } else {
+    log('⏭ Skipping Workday tenants (mode: ats-boards-only)');
+  }
 
   const allJobs = [...ghJobs, ...abJobs, ...lvJobs, ...srJobs, ...wkJobs, ...wdJobs];
 

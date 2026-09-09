@@ -332,16 +332,22 @@ async function fetchWorkdayTenantsFromSupabase() {
 }
 
 // ── Insert jobs ───────────────────────────────────────────────────────────────
-// FIXED: switched insert() -> upsert(..., { onConflict: 'url', ignoreDuplicates: true }).
-// Root cause of the crash this was fixing: applications.url now has a unique
-// constraint, but insert() fails the ENTIRE batch if even one row collides --
-// Postgres doesn't skip just the bad row. upsert+ignoreDuplicates skips
-// colliding rows gracefully instead, same pattern insertCompanies() already
-// uses successfully in discover-companies.js.
-// ALSO FIXED: removed a `.catch(() => {})` chained directly onto a Supabase
-// query builder call -- this throws "catch is not a function" because
-// Supabase's builder isn't a real Promise until awaited. Destructure
-// { error } and check it instead, per the documented project gotcha.
+// FIXED (this version): onConflict was set to 'url', but the table's real
+// unique constraint is `applications_ats_external_unique`, enforced on
+// (ats_type, external_id) -- NOT on url. Telling Postgres to resolve
+// conflicts on a column that isn't the actual constrained pair meant it
+// couldn't apply ON CONFLICT at all, so it threw a hard duplicate-key
+// error and failed the ENTIRE batch instead of gracefully skipping
+// individual colliding rows. Confirmed from a real run: 107 well-scored
+// jobs found, both insert calls errored with
+// "duplicate key value violates unique constraint
+// applications_ats_external_unique", and 0 jobs were inserted despite the
+// run otherwise completing successfully in under 8 minutes.
+//
+// PRIOR FIX (still valid): switched insert() -> upsert(...) in the first
+// place, since insert() fails the entire batch on any single collision --
+// Postgres doesn't skip just the bad row. That part of the reasoning was
+// correct; only the onConflict target was wrong.
 
 async function insertJobs(jobs) {
   if (jobs.length === 0) return { inserted: 0, archived: 0 };
@@ -375,7 +381,7 @@ async function insertJobs(jobs) {
         match_score: j.match_score,
         source: j.source,
       })),
-      { onConflict: 'url', ignoreDuplicates: true }
+      { onConflict: 'ats_type,external_id', ignoreDuplicates: true }
     ).select();
     if (error) log(`  ❌ Insert error (queue): ${error.message}`);
     else inserted = (data || []).length; // ignoreDuplicates means skipped rows aren't returned/counted
@@ -396,7 +402,7 @@ async function insertJobs(jobs) {
         match_score: j.match_score,
         source: j.source,
       })),
-      { onConflict: 'url', ignoreDuplicates: true }
+      { onConflict: 'ats_type,external_id', ignoreDuplicates: true }
     ).select();
     if (error) log(`  ❌ Insert error (archive): ${error.message}`);
     else archived = (data || []).length;

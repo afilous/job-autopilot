@@ -4,12 +4,6 @@
  * Programmable Search Engine scoped to 18 job-board/ATS domains
  * (jobs.ashbyhq.com, boards.greenhouse.io, *.myworkdayjobs.com, etc.)
  *
- * WHY THIS EXISTS: a plain Google search for "business operations"
- * site:jobs.ashbyhq.com (etc.) consistently outperformed company-by-company
- * lookups during manual review -- this automates that exact pattern,
- * rotating through the search terms that proved highest-yield, so it
- * doesn't burn the whole daily quota on one term.
- *
  * Scores jobs at insert time using the same lib/scoring.js used by
  * discover-jobs-api.js, so Director exclusions, CoS stage-gating, and the
  * Strategic Finance rule all apply identically here.
@@ -35,11 +29,6 @@ function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ── Rotating search terms ──────────────────────────────────────────────────
-// Ordered roughly by how productive each term proved to be during manual
-// review. Each run uses QUERIES_PER_RUN terms, picked by day-of-year so the
-// rotation cycles through the full list over time rather than always
-// hitting the same few terms first (which would happen with a fixed slice
-// if the list is longer than QUERIES_PER_RUN).
 const SEARCH_TERMS = [
   '"chief of staff"',
   '"business operations"',
@@ -63,11 +52,9 @@ const SEARCH_TERMS = [
   '"strategic planning"',
 ];
 
-const QUERIES_PER_RUN = 15; // stays comfortably under the 100/day free limit
-                            // even with a little slack for manual reruns
+const QUERIES_PER_RUN = 15;
 
 function pickTermsForToday() {
-  // Day-of-year based rotation so the same terms don't always run first.
   const start = new Date(new Date().getFullYear(), 0, 0);
   const diff = Date.now() - start.getTime();
   const dayOfYear = Math.floor(diff / (1000 * 60 * 60 * 24));
@@ -86,7 +73,7 @@ async function searchGoogle(term) {
   url.searchParams.set('key', GOOGLE_SEARCH_API_KEY);
   url.searchParams.set('cx', GOOGLE_SEARCH_ENGINE_ID);
   url.searchParams.set('q', term);
-  url.searchParams.set('num', '10'); // max per call on the free tier
+  url.searchParams.set('num', '10');
 
   try {
     const res = await fetch(url.toString(), { signal: AbortSignal.timeout(10000) });
@@ -104,21 +91,12 @@ async function searchGoogle(term) {
 }
 
 // ── Parse a search result into a job candidate ─────────────────────────────
-// Search snippets don't reliably expose structured company/department/
-// location fields the way an ATS API does, so this is inherently fuzzier
-// than discover-jobs-api.js. We extract what we can from the title/snippet
-// and let scoreJob()'s title-based logic do most of the real filtering.
-// Location defaults to blank -- NOT hardcoded to Bay Area -- so scoreJob's
-// existing location gate still applies; if a listing doesn't mention a
-// qualifying location anywhere in the title/snippet text, it will
-// correctly fail the gate rather than being assumed to qualify.
 
 function resultToJob(item, searchTerm) {
   const title = item.title || '';
   const snippet = item.snippet || '';
   const link = item.link || '';
 
-  // crude company-name guess from the URL path (e.g. jobs.ashbyhq.com/acme/... -> "acme")
   let company = 'Unknown';
   try {
     const u = new URL(link);
@@ -133,18 +111,22 @@ function resultToJob(item, searchTerm) {
     company,
     ats_type: 'google-search',
     ats_slug: null,
-    external_id: link, // URL itself is the natural unique key for this source
+    external_id: link,
     url: link,
-    location: snippet, // full snippet passed through so scoreJob's
-                        // location + description checks both get a shot
-                        // at whatever geographic/remote info is present
+    location: snippet,
     description: snippet,
-    match_score: null, // filled in below
+    match_score: null,
     source: `google-search:${searchTerm}`,
   };
 }
 
-// ── Insert jobs (same upsert pattern as discover-jobs-api.js) ─────────────
+// ── Insert jobs ───────────────────────────────────────────────────────────────
+// FIXED: onConflict was set to 'url', but the table's real unique
+// constraint, applications_ats_external_unique, is enforced on
+// (ats_type, external_id) -- NOT on url. This mismatch meant Postgres
+// couldn't resolve conflicts via ON CONFLICT and threw a hard duplicate-key
+// error, failing the entire batch instead of skipping individual repeat
+// rows. Same root cause and fix as discover-jobs-api.js.
 
 async function insertJobs(jobs) {
   if (jobs.length === 0) return { inserted: 0, archived: 0 };
@@ -178,7 +160,7 @@ async function insertJobs(jobs) {
         match_score: j.match_score,
         source: j.source,
       })),
-      { onConflict: 'url', ignoreDuplicates: true }
+      { onConflict: 'ats_type,external_id', ignoreDuplicates: true }
     ).select();
     if (error) log(`  ❌ Insert error (queue): ${error.message}`);
     else inserted = (data || []).length;
@@ -199,7 +181,7 @@ async function insertJobs(jobs) {
         match_score: j.match_score,
         source: j.source,
       })),
-      { onConflict: 'url', ignoreDuplicates: true }
+      { onConflict: 'ats_type,external_id', ignoreDuplicates: true }
     ).select();
     if (error) log(`  ❌ Insert error (archive): ${error.message}`);
     else archived = (data || []).length;
@@ -238,7 +220,7 @@ async function main() {
       if (job.match_score > 0) allJobs.push(job);
     }
 
-    await sleep(500); // gentle pacing between calls, not required by the API but polite
+    await sleep(500);
   }
 
   const seen = new Set();

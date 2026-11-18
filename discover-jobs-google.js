@@ -17,6 +17,8 @@
 
 const { createClient } = require('@supabase/supabase-js');
 const { scoreJob } = require('./lib/scoring');
+const { guessAtsType, guessCompanySlug, looksLikeJobUrl } = require('./lib/url-capture');
+const { logRun } = require('./lib/runlog');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
@@ -80,13 +82,13 @@ async function searchGoogle(term) {
     if (!res.ok) {
       const body = await res.text().catch(() => '');
       log(`  ⚠ Google Search API error for "${term}": ${res.status} ${body.slice(0, 200)}`);
-      return [];
+      return null;
     }
     const data = await res.json();
     return data.items || [];
   } catch (e) {
     log(`  ⚠ Google Search API fetch failed for "${term}": ${e.message}`);
-    return [];
+    return null;
   }
 }
 
@@ -97,20 +99,16 @@ function resultToJob(item, searchTerm) {
   const snippet = item.snippet || '';
   const link = item.link || '';
 
-  let company = 'Unknown';
-  try {
-    const u = new URL(link);
-    const parts = u.pathname.split('/').filter(Boolean);
-    if (parts.length > 0) {
-      company = parts[0].replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-    }
-  } catch (e) { /* leave as Unknown */ }
+  const slug = guessCompanySlug(link);
+  const company = slug && slug !== 'unknown'
+    ? slug.replace(/[-_]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
+    : 'Unknown';
 
   return {
     job_title: title,
     company,
-    ats_type: 'google-search',
-    ats_slug: null,
+    ats_type: guessAtsType(link),
+    ats_slug: slug,
     external_id: link,
     url: link,
     location: snippet,
@@ -194,8 +192,8 @@ async function insertJobs(jobs) {
 
 async function main() {
   if (!GOOGLE_SEARCH_API_KEY || !GOOGLE_SEARCH_ENGINE_ID) {
-    log('⚠ GOOGLE_SEARCH_API_KEY or GOOGLE_SEARCH_ENGINE_ID not set — skipping');
-    return;
+    log('❌ GOOGLE_SEARCH_API_KEY or GOOGLE_SEARCH_ENGINE_ID not set');
+    throw new Error('Google search secrets are not configured');
   }
 
   const terms = pickTermsForToday();
@@ -203,12 +201,15 @@ async function main() {
   log(`   Terms: ${terms.join(', ')}`);
 
   let allJobs = [];
+  let failedQueries = 0;
 
   for (const term of terms) {
     const results = await searchGoogle(term);
+    if (results === null) { failedQueries++; await sleep(500); continue; }
     log(`  "${term}": ${results.length} result(s)`);
 
     for (const item of results) {
+      if (!looksLikeJobUrl(item.link)) continue;
       const job = resultToJob(item, term);
       job.match_score = scoreJob({
         title: job.job_title,
@@ -223,6 +224,15 @@ async function main() {
     await sleep(500);
   }
 
+  // LOUD FAILURE: this script used to log a warning and exit green when the
+  // Google API rejected every call, so it silently produced nothing for months.
+  if (failedQueries === terms.length) {
+    const msg = `All ${terms.length} Google searches failed (check GOOGLE_SEARCH_API_KEY / ENGINE_ID; the Custom Search JSON API is closed to new customers and being retired)`;
+    await logRun(supabase, 'discover-jobs-google', { errors: failedQueries, notes: msg });
+    throw new Error(msg);
+  }
+  if (failedQueries > 0) log(`  ⚠ ${failedQueries}/${terms.length} searches failed`);
+
   const seen = new Set();
   const uniqueJobs = allJobs.filter(j => {
     if (!j.external_id || seen.has(j.external_id)) return false;
@@ -236,9 +246,10 @@ async function main() {
   const { inserted, archived } = await insertJobs(uniqueJobs);
   log(`\n✅ Inserted ${inserted} new jobs into queue`);
   log(`🗄 Archived ${archived} low-score jobs`);
+  await logRun(supabase, 'discover-jobs-google', { found: uniqueJobs.length, inserted, archived, errors: failedQueries });
 }
 
-main().catch(err => {
+main().catch(async err => {
   log(`💥 Fatal: ${err.message}`);
   process.exit(1);
 });

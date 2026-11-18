@@ -7,6 +7,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { scoreJob } = require('./lib/scoring');
 const { SMARTRECRUITERS_SLUGS, fetchSmartRecruitersJobs, WORKABLE_SLUGS, fetchWorkableJobs } = require('./new-ats-fetchers');
 const { fetchAllWorkdayJobs } = require('./workday-fetcher');
+const { logRun } = require('./lib/runlog');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
@@ -499,9 +500,11 @@ async function main() {
   log(`\n✅ Inserted ${inserted} new jobs into queue`);
   log(`🗄 Archived ${archived} low-score jobs`);
   log(`⏭ Skipped ${uniqueJobs.length - inserted - archived} already in database`);
+  await logRun(supabase, `discover-jobs-api:${MODE}`, { found: allJobs.length, inserted, archived });
 }
 
-main().catch(err => {
+main().catch(async err => {
   log(`💥 Fatal: ${err.message}`);
+  await logRun(supabase, 'discover-jobs-api', { errors: 1, notes: err.message });
   process.exit(1);
 });

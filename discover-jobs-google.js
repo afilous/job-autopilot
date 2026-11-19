@@ -6,10 +6,12 @@
  * same idea — "search the ATS job boards for my target titles" — through a
  * search API that works:
  *
- *   1. Bright Data (BRIGHTDATA_API_KEY + BRIGHTDATA_ZONE) — 5,000 free/month, renews, no card.
- *   2. Tavily   (TAVILY_API_KEY)  — 1,000 free credits/month, renews, no card.
- *   3. SerpApi  (SERPAPI_KEY)     — 250 free/month, renews (shared with discover-jobs.js).
- *   4. Serper   (SERPER_API_KEY)  — 2,500 one-time credits, never renew; spent last.
+ *   Combined (every query goes to both, results merged and de-duplicated):
+ *     Tavily      (TAVILY_API_KEY)                      — 1,000 free credits/month
+ *     Bright Data (BRIGHTDATA_API_KEY + BRIGHTDATA_ZONE) — 5,000 free/month
+ *   Backup (only if both of the above fail):
+ *     SerpApi (SERPAPI_KEY) — 250 free/month, shared with discover-jobs.js
+ *     Serper  (SERPER_API_KEY) — 2,500 one-time credits, never renew
  *   Budgets are tracked in Supabase (view api_quota_status) and every call stops
  *   before the free limit, so nothing is ever billed.
  *
@@ -38,7 +40,7 @@ const SERPAPI_KEY = process.env.SERPAPI_KEY;
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 const BRIGHTDATA_API_KEY = process.env.BRIGHTDATA_API_KEY;
 const BRIGHTDATA_ZONE = process.env.BRIGHTDATA_ZONE;
-const QUERIES_PER_RUN = parseInt(process.env.QUERIES_PER_RUN || '12', 10);
+const QUERIES_PER_RUN = parseInt(process.env.QUERIES_PER_RUN || '16', 10);
 // Time window for results: d = past 24 hours (default), w = past week, m = past month
 const WINDOW = ['d','w','m'].includes(process.env.SEARCH_WINDOW) ? process.env.SEARCH_WINDOW : 'd';
 const DRY_RUN = String(process.env.DRY_RUN || '').toLowerCase() === 'true';
@@ -188,33 +190,55 @@ async function searchTavily(q, term) {
   }
 }
 
-// Spend order: monthly-renewing free credits first (use-it-or-lose-it), the
-// one-time credits last so they last as long as possible. Every call is counted
+// Providers come in two groups, all on free credits only. Every call is counted
 // in Supabase (api_quota) and stops before the free limit, so nothing is billed.
+//   combine: monthly-renewing credits. Every query goes to ALL of these and the
+//            results are merged (different engines surface different postings).
+//   backup:  SerpApi (small, shared) and Serper (one-time credits that never
+//            renew). Used only when every "combine" provider failed.
 const PROVIDERS = [
-  { name: 'brightdata', key: BRIGHTDATA_API_KEY && BRIGHTDATA_ZONE, fn: searchBrightData },
-  { name: 'tavily',  key: TAVILY_API_KEY, fn: searchTavily },
-  { name: 'serpapi', key: SERPAPI_KEY,    fn: searchSerpApi },
-  { name: 'serper',  key: SERPER_API_KEY, fn: searchSerper },
+  { name: 'tavily',     key: TAVILY_API_KEY,                          fn: searchTavily,     combine: true },
+  { name: 'brightdata', key: BRIGHTDATA_API_KEY && BRIGHTDATA_ZONE,   fn: searchBrightData, combine: true },
+  { name: 'serpapi',    key: SERPAPI_KEY,                             fn: searchSerpApi,    combine: false },
+  { name: 'serper',     key: SERPER_API_KEY,                          fn: searchSerper,     combine: false },
 ].filter(p => p.key);
 const used = {};
 const exhausted = new Set();
 
-/** Runs one query on the first provider that has a key, free budget left, and works. */
+async function callProvider(p, q, term) {
+  if (exhausted.has(p.name)) return null;
+  if (!(await spend(supabase, p.name))) {
+    log(`  ⏭ ${p.name}: free budget used up`);
+    exhausted.add(p.name);
+    return null;
+  }
+  const results = await p.fn(q, term);
+  if (results !== null) used[p.name] = (used[p.name] || 0) + 1;
+  return results;
+}
+
+/** Runs one query on every "combine" provider and merges; falls back to the backups. */
 async function search(q, term) {
-  for (const p of PROVIDERS) {
-    if (exhausted.has(p.name)) continue;
-    if (!(await spend(supabase, p.name))) {
-      log(`  ⏭ ${p.name}: free budget used up, trying the next provider`);
-      exhausted.add(p.name);
-      continue;
+  const merged = [];
+  const seen = new Set();
+  let anyWorked = false;
+  for (const p of PROVIDERS.filter(x => x.combine)) {
+    const results = await callProvider(p, q, term);
+    if (results === null) continue;
+    anyWorked = true;
+    for (const r of results) {
+      const key = String(r.link || '').replace(/^http:/, 'https:').replace(/[?#].*$/, '').replace(/\/$/, '').toLowerCase();
+      if (key && !seen.has(key)) { seen.add(key); merged.push(r); }
     }
-    const results = await p.fn(q, term);
-    if (results !== null) { used[p.name] = (used[p.name] || 0) + 1; return results; }
+  }
+  if (anyWorked) return merged;
+  for (const p of PROVIDERS.filter(x => !x.combine)) {
+    const results = await callProvider(p, q, term);
+    if (results !== null) return results;
   }
   return null;
 }
-const PROVIDER = PROVIDERS.map(p => p.name).join('>') || 'none';
+const PROVIDER = PROVIDERS.map(p => p.name).join('+') || 'none';
 
 // ── Turn a search hit into a job candidate ───────────────────────────────────
 

@@ -1,3 +1,5 @@
+> See README.md for the full list of workflows and secrets. This file covers the original nightly submit setup.
+
 # Job Autopilot — GitHub Actions Setup
 
 ## What this does
@@ -20,7 +22,7 @@ Click "New repository secret" for each:
 | Secret name | Value |
 |---|---|
 | `SUPABASE_URL` | `https://xvmjgyninryegrkfryma.supabase.co` |
-| `SUPABASE_ANON_KEY` | `sb_publishable_-OBN-INxURCAr20zzq-8oQ_-aEf3L1t` |
+| `SUPABASE_ANON_KEY` | the project's publishable key (Supabase → Settings → API) |
 | `GEMINI_API_KEY` | your Gemini API key from Settings tab in the app |
 
 ### Step 3 — Test it manually

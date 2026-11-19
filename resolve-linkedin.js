@@ -4,7 +4,7 @@
  * LinkedIn alert emails give us only company + title (+ location now). Tsenta
  * cannot open LinkedIn links, so this script finds the employer's OWN posting:
  *
- *   1. Take unresolved LinkedIn rows (queued/manual, url still on linkedin.com)
+ *   1. Take unresolved rows (queued/manual) whose link is LinkedIn or a job aggregator
  *   2. Find the company's job board (companies table first, then probe likely
  *      slugs on Greenhouse, Ashby, Lever, Workable, SmartRecruiters)
  *   3. Match the LinkedIn title against that board's open postings
@@ -307,7 +307,7 @@ async function applyMatch(row, m) {
     location: job.location || row.location || null,
     link_status: 'live',
     link_checked_at: stamp,
-    notes: `${row.notes ? row.notes + ' | ' : ''}resolved from LinkedIn #${row.linkedin_job_id || ''} via ${board.ats_type}/${board.slug}${m.alternatives > 1 ? ` (${m.alternatives} postings share this title)` : ''}`,
+    notes: `${row.notes ? row.notes + ' | ' : ''}resolved from ${row.linkedin_job_id ? 'LinkedIn #' + row.linkedin_job_id : 'job-aggregator link'} via ${board.ats_type}/${board.slug}${m.alternatives > 1 ? ` (${m.alternatives} postings share this title)` : ''}`,
   }).eq('id', row.id);
   if (error) return { action: 'error', error: error.message };
   return { action: 'resolve', url: job.url, location: job.location };
@@ -323,14 +323,24 @@ async function markUnresolved(rows, why) {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
+// Any row whose link points at LinkedIn or a job aggregator (not the employer's own
+// board) can be swapped for the direct Greenhouse/Ashby/Lever/Workable/SmartRecruiters
+// posting. Indeed and Wellfound links are left alone: Tsenta applies to those directly.
+const AGGREGATOR_HOSTS = [
+  'linkedin.com', 'jobleads.com', 'bebee.com', 'builtinsf.com', 'builtin.com', 'ziprecruiter.com',
+  'glassdoor.com', 'simplyhired.com', 'talent.com', 'jooble.org', 'adzuna.com', 'themuse.com',
+  'trueup.io', 'learn4good.com', 'careerbuilder.com', 'monster.com', 'lensa.com', 'jobrapido.com',
+  'recruit.net', 'nexxt.com', 'dice.com', 'joinrise.co', 'swooped.co', 'jobgether.com',
+];
+const AGGREGATOR_URL_FILTER = AGGREGATOR_HOSTS.map(h => `url.ilike.%${h}%`).join(',');
+
 async function loadRows() {
   const cutoff = new Date(Date.now() - 3 * 86400000).toISOString();
   const oldest = new Date(Date.now() - 45 * 86400000).toISOString();
   const { data, error } = await supabase.from('applications')
     .select('id, company, job_title, location, notes, linkedin_job_id, link_status, link_checked_at, created_at')
-    .eq('source', 'linkedin')
     .in('status', ['queued', 'manual'])
-    .ilike('url', '%linkedin.com%')
+    .or(AGGREGATOR_URL_FILTER)
     .in('fit_tier', ['apply', 'review'])
     .gte('created_at', oldest)
     .or(`link_status.is.null,and(link_status.eq.unresolved,link_checked_at.lt.${cutoff})`)

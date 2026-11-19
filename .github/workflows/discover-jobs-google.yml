@@ -1,8 +1,9 @@
 name: Job Autopilot - Discover Jobs (Web Search)
 
 # Searches the ATS job boards (Ashby, Greenhouse, Lever, Workable, SmartRecruiters...)
-# for target titles through Bright Data, Tavily, SerpApi and Serper, in that order, using only free credits
-# (counted in Supabase view api_quota_status; each stops before its free limit).
+# for target titles. Every query goes to Tavily and Bright Data and the results are
+# merged; SerpApi and Serper are backups. Free credits only (counted in Supabase
+# view api_quota_status; each provider stops before its free limit).
 # Runs daily on a past-24-hours window (about 480 searches a month on each of
 # Tavily and Bright Data, well inside their free limits), so new postings are
 # seen the day they appear. Manual runs default to the past week.

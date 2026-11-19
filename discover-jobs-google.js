@@ -6,9 +6,10 @@
  * same idea — "search the ATS job boards for my target titles" — through a
  * search API that works:
  *
- *   1. Tavily   (TAVILY_API_KEY)  — 1,000 free credits/month, renews, no card.
- *   2. SerpApi  (SERPAPI_KEY)     — 250 free/month, renews (shared with discover-jobs.js).
- *   3. Serper   (SERPER_API_KEY)  — 2,500 one-time credits, never renew; spent last.
+ *   1. Bright Data (BRIGHTDATA_API_KEY + BRIGHTDATA_ZONE) — 5,000 free/month, renews, no card.
+ *   2. Tavily   (TAVILY_API_KEY)  — 1,000 free credits/month, renews, no card.
+ *   3. SerpApi  (SERPAPI_KEY)     — 250 free/month, renews (shared with discover-jobs.js).
+ *   4. Serper   (SERPER_API_KEY)  — 2,500 one-time credits, never renew; spent last.
  *   Budgets are tracked in Supabase (view api_quota_status) and every call stops
  *   before the free limit, so nothing is ever billed.
  *
@@ -35,6 +36,8 @@ const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const SERPER_API_KEY = process.env.SERPER_API_KEY;
 const SERPAPI_KEY = process.env.SERPAPI_KEY;
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
+const BRIGHTDATA_API_KEY = process.env.BRIGHTDATA_API_KEY;
+const BRIGHTDATA_ZONE = process.env.BRIGHTDATA_ZONE;
 const QUERIES_PER_RUN = parseInt(process.env.QUERIES_PER_RUN || '12', 10);
 // Time window for results: d = past 24 hours (default), w = past week, m = past month
 const WINDOW = ['d','w','m'].includes(process.env.SEARCH_WINDOW) ? process.env.SEARCH_WINDOW : 'd';
@@ -133,6 +136,29 @@ async function searchSerpApi(q) {
   }
 }
 
+async function searchBrightData(q) {
+  try {
+    // Bright Data runs a real Google search and returns it parsed (brd_json=1).
+    // It returns 10 results per call. tbs (time filter) is a normal Google parameter.
+    const url = `https://www.google.com/search?${new URLSearchParams({ q, gl: 'us', hl: 'en', tbs: `qdr:${WINDOW}`, brd_json: '1' })}`;
+    const res = await fetch('https://api.brightdata.com/request', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${BRIGHTDATA_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ zone: BRIGHTDATA_ZONE, url, format: 'raw' }),
+      signal: AbortSignal.timeout(60000),
+    });
+    if (!res.ok) {
+      log(`  ⚠ Bright Data error ${res.status}: ${(await res.text().catch(() => '')).slice(0, 200)}`);
+      return null;
+    }
+    const data = await res.json();
+    return (data.organic || []).map(r => ({ title: r.title, link: r.link, snippet: r.description }));
+  } catch (e) {
+    log(`  ⚠ Bright Data fetch failed: ${e.message}`);
+    return null;
+  }
+}
+
 async function searchTavily(q, term) {
   try {
     const range = { d: 'day', w: 'week', m: 'month' }[WINDOW];
@@ -164,6 +190,7 @@ async function searchTavily(q, term) {
 // one-time credits last so they last as long as possible. Every call is counted
 // in Supabase (api_quota) and stops before the free limit, so nothing is billed.
 const PROVIDERS = [
+  { name: 'brightdata', key: BRIGHTDATA_API_KEY && BRIGHTDATA_ZONE, fn: searchBrightData },
   { name: 'tavily',  key: TAVILY_API_KEY, fn: searchTavily },
   { name: 'serpapi', key: SERPAPI_KEY,    fn: searchSerpApi },
   { name: 'serper',  key: SERPER_API_KEY, fn: searchSerper },
@@ -285,7 +312,7 @@ async function insertJobs(jobs) {
 
 async function main() {
   if (PROVIDERS.length === 0) {
-    const msg = 'No search API key set: add TAVILY_API_KEY, SERPER_API_KEY or SERPAPI_KEY as a GitHub secret';
+    const msg = 'No search API key set: add BRIGHTDATA_API_KEY + BRIGHTDATA_ZONE, TAVILY_API_KEY, SERPER_API_KEY or SERPAPI_KEY as a GitHub secret';
     log(`❌ ${msg}`);
     await logRun(supabase, 'discover-jobs-google', { errors: 1, notes: msg });
     throw new Error(msg);

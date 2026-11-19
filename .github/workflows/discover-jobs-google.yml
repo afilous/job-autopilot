@@ -1,7 +1,7 @@
 name: Job Autopilot - Discover Jobs (Web Search)
 
 # Searches the ATS job boards (Ashby, Greenhouse, Lever, Workable, SmartRecruiters...)
-# for target titles through Tavily, SerpApi and Serper, in that order, using only free credits
+# for target titles through Bright Data, Tavily, SerpApi and Serper, in that order, using only free credits
 # (counted in Supabase view api_quota_status; each stops before its free limit).
 # Runs Mon/Thu with a past-week window, so nothing falls between runs and
 # monthly search usage stays low (~104 searches).
@@ -43,6 +43,8 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          BRIGHTDATA_API_KEY: ${{ secrets.BRIGHTDATA_API_KEY }}
+          BRIGHTDATA_ZONE: ${{ secrets.BRIGHTDATA_ZONE }}
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
           SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}

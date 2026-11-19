@@ -1,0 +1,41 @@
+name: Job Autopilot - Discover Newsletters
+
+# Reads startup job newsletters on Substack (Next Play and others listed in the
+# Supabase table job_newsletters) and saves the job boards they link to, so the
+# daily ATS discovery scans those startups in full. Free; no API key.
+
+on:
+  schedule:
+    - cron: "30 15 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run: print what was found, write nothing to Supabase'
+        required: false
+        default: false
+        type: boolean
+      lookback_days:
+        description: 'How many days of past posts to read'
+        required: false
+        default: '21'
+
+jobs:
+  discover-newsletters:
+    name: Discover companies from newsletters
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: npm install
+
+      - name: Run newsletter discovery
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '21' }}
+        run: node discover-newsletters.js

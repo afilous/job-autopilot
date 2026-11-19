@@ -147,8 +147,9 @@ async function enrich(supabase, searcher) {
       const h = parseHeadline(r.title, r.snippet, { allowLate: true });
       if (!h) continue;
       const hk = keyOf(h.name);
-      if (!(hk === key || hk.startsWith(key) || key.startsWith(hk))) continue; // headline must be about this company
+      if (hk !== key) continue; // headline must name exactly this company ("Box" must not match "Boxy Labs")
       const year = yearOf(r.link, r.title);
+      if (!year || year < new Date().getFullYear() - 4) continue; // unknown or old: not trusted
       if (!best || (year || 0) > (best.announced_year || 0)) best = { ...h, announced_year: year, headline: r.title, source_url: r.link };
     }
     if (best) { withStage++; log(`   ✔ ${name}: ${best.stage}${best.announced_year ? ` (${best.announced_year})` : ''}`); }

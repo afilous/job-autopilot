@@ -2,13 +2,13 @@ name: Job Autopilot - Discover Jobs (Web Search)
 
 # Searches the ATS job boards (Ashby, Greenhouse, Lever, Workable, SmartRecruiters...)
 # for target titles through Serper.dev (or SerpApi as a fallback).
-# Runs Mon/Wed/Fri with a past-week window, so nothing falls between runs and
-# monthly search usage stays low (~156 searches).
+# Runs Mon/Thu with a past-week window, so nothing falls between runs and
+# monthly search usage stays low (~104 searches).
 # The old Google Custom Search API returns 403 and is being retired.
 
 on:
   schedule:
-    - cron: "0 16 * * 1,3,5"
+    - cron: "0 16 * * 1,4"
   workflow_dispatch:
     inputs:
       dry_run:

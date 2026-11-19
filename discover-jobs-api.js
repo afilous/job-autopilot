@@ -500,7 +500,12 @@ async function main() {
   log(`\n✅ Inserted ${inserted} new jobs into queue`);
   log(`🗄 Archived ${archived} low-score jobs`);
   log(`⏭ Skipped ${uniqueJobs.length - inserted - archived} already in database`);
-  await logRun(supabase, `discover-jobs-api:${MODE}`, { found: allJobs.length, inserted, archived });
+  const wdFailed = wdJobs.failedTenants || [];
+  await logRun(supabase, `discover-jobs-api:${MODE}`, {
+    found: allJobs.length, inserted, archived, errors: wdFailed.length,
+    notes: wdFailed.length ? `Workday tenants unreadable: ${wdFailed.join(', ').slice(0, 400)}` : undefined,
+  });
+  if (wdFailed.length > 10) throw new Error(`${wdFailed.length} Workday tenants could not be read (rate limited?)`);
 }
 
 main().catch(async err => {

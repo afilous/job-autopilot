@@ -69,19 +69,30 @@ async function fetchWorkdayJobs(tenantConfig, scoreJobFn, searchText = '') {
 
   for (let page = 0; page < MAX_PAGES; page++) {
     try {
-      const res = await fetch(searchUrl, {
-        method: 'POST',
-        headers: {
-          'Accept': 'application/json',
-          'Content-Type': 'application/json',
-          'Accept-Language': 'en-US',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Referer': `${baseUrl}/en-US/${site}`,
-        },
-        body: JSON.stringify({ appliedFacets: {}, limit: PAGE_SIZE, offset, searchText }),
-        signal: AbortSignal.timeout(10000),
-      });
-      if (!res.ok) { log(`  ⚠ Workday ${company}: HTTP ${res.status}`); break; }
+      // Workday / Akamai rate-limits (HTTP 429) when many tenants are hit in a row.
+      // Wait and retry (honoring Retry-After) instead of giving up on the tenant.
+      let res;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        res = await fetch(searchUrl, {
+          method: 'POST',
+          headers: {
+            'Accept': 'application/json',
+            'Content-Type': 'application/json',
+            'Accept-Language': 'en-US',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': `${baseUrl}/en-US/${site}`,
+          },
+          body: JSON.stringify({ appliedFacets: {}, limit: PAGE_SIZE, offset, searchText }),
+          signal: AbortSignal.timeout(15000),
+        });
+        if (res.status !== 429 && res.status < 500) break;
+        if (attempt === 3) break;
+        const retryAfter = parseInt(res.headers.get('retry-after') || '', 10);
+        const wait = Math.min(!isNaN(retryAfter) ? retryAfter * 1000 : [5000, 15000, 45000][attempt], 60000);
+        log(`  ⏳ Workday ${company}: HTTP ${res.status}, retrying in ${Math.round(wait / 1000)}s`);
+        await sleep(wait);
+      }
+      if (!res.ok) { log(`  ⚠ Workday ${company}: HTTP ${res.status} (gave up)`); results.failed = `HTTP ${res.status}`; break; }
       const data = await res.json();
       const postings = data.jobPostings || [];
       if (postings.length === 0) break;
@@ -113,6 +124,7 @@ async function fetchWorkdayJobs(tenantConfig, scoreJobFn, searchText = '') {
       await sleep(400);
     } catch (e) {
       log(`  ⚠ Workday ${company} error: ${e.message}`);
+      results.failed = e.message;
       break;
     }
   }
@@ -137,13 +149,34 @@ async function fetchAllWorkdayJobs(scoreJobFn, extraTenants = []) {
   log(`  📋 Workday tenants to check: ${allTenants.length} (${WORKDAY_TENANTS.length} floor + ${extraTenants.length} from Supabase, deduped)`);
 
   const allJobs = [];
+  let failed = [];
   for (const tenantConfig of allTenants) {
     log(`  🔍 Workday: ${tenantConfig.company}...`);
     const jobs = await fetchWorkdayJobs(tenantConfig, scoreJobFn);
     log(`    → ${jobs.length} relevant postings`);
     allJobs.push(...jobs);
-    await sleep(1000);
+    if (jobs.failed) failed.push(tenantConfig);
+    await sleep(1500);
   }
+
+  // Second pass: tenants that were rate-limited get one more try after a pause.
+  if (failed.length > 0) {
+    log(`  🔁 Retrying ${failed.length} Workday tenant(s) after a pause: ${failed.map(t => t.company).join(', ')}`);
+    await sleep(30000);
+    const still = [];
+    for (const tenantConfig of failed) {
+      const jobs = await fetchWorkdayJobs(tenantConfig, scoreJobFn);
+      log(`    ${tenantConfig.company} → ${jobs.length} relevant postings${jobs.failed ? ' (still failing)' : ''}`);
+      allJobs.push(...jobs);
+      if (jobs.failed) still.push(tenantConfig);
+      await sleep(3000);
+    }
+    failed = still;
+  }
+
+  // Never let a tenant that returns nothing but errors look like "no jobs".
+  allJobs.failedTenants = failed.map(t => t.company);
+  if (failed.length > 0) log(`  ❌ ${failed.length} Workday tenant(s) could not be read: ${allJobs.failedTenants.join(', ')}`);
   return allJobs;
 }
 

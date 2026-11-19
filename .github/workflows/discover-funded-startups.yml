@@ -15,14 +15,20 @@ on:
         required: false
         default: false
         type: boolean
-      search_window:
-        description: 'Time window: d = past 24 hours, w = past week, m = past month'
+      mode:
+        description: 'news = recent funding headlines, backfill = past year by sector, enrich = funding stage of companies already in the job list'
         required: false
-        default: 'w'
+        default: 'news'
+        type: choice
+        options: [news, backfill, enrich]
+      search_window:
+        description: 'Window for news mode: d, w, m (backfill uses y, enrich uses any time unless set)'
+        required: false
+        default: ''
       max_lookups:
         description: 'Max companies to look up job boards for'
         required: false
-        default: '25'
+        default: '40'
 
 jobs:
   discover-funded:
@@ -47,6 +53,23 @@ jobs:
           SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
           SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
-          SEARCH_WINDOW: ${{ github.event.inputs.search_window || 'd' }}
-          MAX_LOOKUPS: ${{ github.event.inputs.max_lookups || '25' }}
+          MODE: ${{ github.event.inputs.mode || 'news' }}
+          SEARCH_WINDOW: ${{ github.event.inputs.search_window }}
+          MAX_LOOKUPS: ${{ github.event.inputs.max_lookups || '40' }}
+        run: node discover-funded-startups.js
+
+      # Scheduled runs also check the funding stage of ~40 companies from your job list
+      # each day (so older raises are covered), and a manual 'news' run does too.
+      - name: Enrich funding stage for companies in the job list
+        if: ${{ github.event_name == 'schedule' }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          BRIGHTDATA_API_KEY: ${{ secrets.BRIGHTDATA_API_KEY }}
+          BRIGHTDATA_ZONE: ${{ secrets.BRIGHTDATA_ZONE }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+          MODE: enrich
+          MAX_LOOKUPS: '40'
         run: node discover-funded-startups.js

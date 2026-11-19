@@ -92,6 +92,18 @@ const QUERIES = [
 
 // ── Adzuna ────────────────────────────────────────────────────────────────────
 
+
+// ── Paid-quota guard ──────────────────────────────────────────────────────────
+// JSearch and SerpApi have small monthly free quotas. Their searches look back a
+// full week, so they only need to run every other day. By default they run on
+// Mon / Wed / Fri (UTC weekday numbers below). Manual "Run workflow" clicks
+// always run. Override with SEARCH_API_DAYS="1,2,3,4,5" to run more often.
+function searchApisDueToday() {
+  if (process.env.GITHUB_EVENT_NAME === 'workflow_dispatch') return true;
+  const days = String(process.env.SEARCH_API_DAYS || '1,3,5').split(',').map(d => parseInt(d, 10));
+  return days.includes(new Date().getUTCDay());
+}
+
 async function fetchAdzuna() {
   if (!ADZUNA_APP_ID || !ADZUNA_APP_KEY) { log('⏭ Adzuna: no credentials'); return []; }
   log('🔍 Adzuna: fetching jobs...');
@@ -133,6 +145,7 @@ async function fetchAdzuna() {
 
 async function fetchJSearch() {
   if (!JSEARCH_API_KEY) { log('⏭ JSearch: no credentials'); return []; }
+  if (!searchApisDueToday()) { log('⏭ JSearch: skipped today (runs Mon/Wed/Fri to save quota)'); return []; }
   log('🔍 JSearch: fetching jobs...');
   const jobs = [];
 
@@ -187,6 +200,7 @@ async function fetchJSearch() {
 
 async function fetchSerpApi() {
   if (!SERPAPI_KEY) { log('⏭ SerpApi: no credentials'); return []; }
+  if (!searchApisDueToday()) { log('⏭ SerpApi: skipped today (runs Mon/Wed/Fri to save quota)'); return []; }
   log('🔍 SerpApi: fetching jobs...');
   const jobs = [];
 

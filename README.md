@@ -20,7 +20,8 @@ the Supabase function `classify_job`. Every script writes a row to `run_log`.
 | Workflow | When (UTC) | What it does | Needs |
 |---|---|---|---|
 | `discover-jobs.yml` | weekdays 16:00 | ATS board APIs (free), plus Adzuna / JSearch / SerpApi (Mon + Thu only) | Supabase, optional API keys |
-| `discover-jobs-google.yml` | Mon + Thu 16:00 | Site-scoped web search of ATS boards, past week, results merged from Tavily + Bright Data, with backups | see Secrets |
+| `discover-jobs-google.yml` | daily 16:00 | Site-scoped web search of ATS boards, past 24 h, results merged from Tavily + Bright Data, with backups | see Secrets |
+| `discover-funded-startups.yml` | daily 15:45 | Reads funding news (seed / Series A-B), finds each startup's job board, adds it to the daily ATS scan. Tracked in `funded_startups` | see Secrets |
 | `discover-jobs-workday.yml` | weekdays 16:30 | Workday tenants (Visa, etc.) | Supabase |
 | `discover-newsletters.yml` | daily 15:30 | Reads startup job newsletters on Substack, adds their job boards to `companies` | Supabase |
 | `discover-companies.yml` | 1st + 15th 06:00 | Finds new company job boards (SerpApi site search) | SerpApi |
@@ -60,7 +61,7 @@ dashboard shows different usage, correct `used` in the `api_quota` table.
 ## Useful Supabase views
 
 `job_inbox` (what to look at), `job_inbox_summary`, `source_health` (is each source
-still producing jobs), `api_quota_status`, and the table `tsenta_unsupported_log`
+still producing jobs), `api_quota_status`, `funded_startups_status` (startups found from funding news and whether their job board was found), and the table `tsenta_unsupported_log`
 (jobs Tsenta can't apply to).
 
 ## Conventions

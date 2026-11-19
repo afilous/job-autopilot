@@ -15,8 +15,10 @@
  * Everything is recorded in the Supabase table `funded_startups`
  * (view `funded_startups_status`).
  *
+ * MODE=news (default, daily headlines), backfill (past year, by sector), enrich (funding
+ * stage for companies already in the job list; finds startups that raised a year or two ago).
  * Env: SUPABASE_URL, SUPABASE_ANON_KEY, search keys (see lib/search.js),
- *      SEARCH_WINDOW d|w|m (default d), MAX_LOOKUPS (default 25), DRY_RUN=true
+ *      SEARCH_WINDOW d|w|m|y|a, MAX_LOOKUPS (default 25), DRY_RUN=true
  */
 
 const { createClient } = require('@supabase/supabase-js');
@@ -25,7 +27,8 @@ const { guessAtsType } = require('./lib/url-capture');
 const { logRun } = require('./lib/runlog');
 const { slugFromUrl } = require('./discover-newsletters');
 
-const WINDOW = process.env.SEARCH_WINDOW || 'd';
+const MODE = (process.env.MODE || 'news').toLowerCase(); // news | backfill | enrich
+const WINDOW = process.env.SEARCH_WINDOW || (MODE === 'backfill' ? 'y' : MODE === 'enrich' ? 'a' : 'd');
 const MAX_LOOKUPS = parseInt(process.env.MAX_LOOKUPS || '25', 10);
 const DRY_RUN = String(process.env.DRY_RUN || '').toLowerCase() === 'true';
 
@@ -43,6 +46,8 @@ const FUNDING_QUERIES = [
   'raises pre-seed funding',
   'secures million funding round to scale',
 ];
+const SECTORS = ['AI', 'fintech', 'healthcare', 'developer tools', 'cybersecurity', 'climate', 'enterprise software SaaS', 'marketplace', 'robotics hardware', 'logistics supply chain', 'consumer', 'biotech'];
+const BACKFILL_QUERIES = SECTORS.flatMap(sec => [`${sec} startup raises seed round`, `${sec} startup raises Series A`]);
 const BOARDS = ['jobs.ashbyhq.com', 'boards.greenhouse.io', 'job-boards.greenhouse.io', 'jobs.lever.co', 'apply.workable.com', 'jobs.smartrecruiters.com'];
 const BOARD_ATS = new Set(['greenhouse', 'lever', 'ashby', 'workable', 'smartrecruiters']);
 
@@ -58,7 +63,7 @@ function stageOf(text) {
   const t = String(text || '').toLowerCase();
   if (/pre-?seed/.test(t)) return 'pre-seed';
   if (/\bseed\b/.test(t)) return 'seed';
-  const m = t.match(/series\s+([abc])\b/);
+  const m = t.match(/series\s+([a-h])\b/);
   return m ? `series ${m[1]}` : null;
 }
 
@@ -71,7 +76,7 @@ function amountOf(num, unit) {
 }
 
 /** "Acme raises $12M Series A to ..." -> { name, stage, amount_usd } or null */
-function parseHeadline(title, snippet) {
+function parseHeadline(title, snippet, { allowLate = false } = {}) {
   const t = String(title || '').replace(/^(exclusive|breaking|update)\s*[:\-–]\s*/i, '').replace(/\s+[|–—-]\s+[A-Za-z .]*$/, '').trim();
   const m = t.match(HEADLINE_RE);
   if (!m) return null;
@@ -82,8 +87,16 @@ function parseHeadline(title, snippet) {
   const stage = stageOf(t) || stageOf(String(snippet || '').slice(0, 300));
   if (!stage) return null;
   const amount = amountOf(m[2], m[3]);
-  if (amount !== null && amount > 150e6) return null; // not early stage
+  if (!allowLate && (amount !== null && amount > 150e6 || /^series [c-h]$/.test(stage))) return null; // not early stage
   return { name, stage, amount_usd: amount };
+}
+
+/** Latest plausible year (2019..now) from a URL, headline or snippet. */
+function yearOf(...texts) {
+  const now = new Date().getFullYear();
+  const years = [];
+  for (const t of texts) for (const m of String(t || '').matchAll(/(?:^|[^0-9])(20[12][0-9])(?![0-9])/g)) { const y = +m[1]; if (y >= 2019 && y <= now) years.push(y); }
+  return years.length ? Math.max(...years) : null;
 }
 
 const keyOf = name => String(name).toLowerCase().replace(/[^a-z0-9]+/g, '');
@@ -106,6 +119,61 @@ function boardFromResults(name, results) {
   return null;
 }
 
+// ── Enrich: funding stage for companies already in the job list ──────────────
+// Startups that raised a year or two ago are not in today's news. For every
+// company that has a queued apply/review job, search for its funding history and
+// record the latest round. The Supabase classifier uses this for Chief of Staff /
+// Head-of roles (early-stage only).
+
+async function enrich(supabase, searcher) {
+  const { data: rows, error } = await supabase.from('applications')
+    .select('company').in('fit_tier', ['apply', 'review']).in('status', ['queued', 'manual']).limit(5000);
+  if (error) throw new Error(`Reading companies failed: ${error.message}`);
+  const names = new Map();
+  for (const r of rows || []) { const k = keyOf(r.company || ''); if (k.length >= 3 && !names.has(k)) names.set(k, r.company); }
+
+  const { data: known } = await supabase.from('funded_startups').select('name_key').limit(10000);
+  const have = new Set((known || []).map(r => r.name_key));
+  const todo = [...names.entries()].filter(([k]) => !have.has(k)).slice(0, MAX_LOOKUPS);
+  log(`🏢 ${names.size} companies with open jobs, ${names.size - todo.length - [...names.keys()].filter(k => have.has(k)).length} still unchecked after this batch; checking ${todo.length} now`);
+
+  let withStage = 0, unknown = 0, failed = 0;
+  const out = [];
+  for (const [key, name] of todo) {
+    const results = await searcher.search(`"${name}" raises funding round seed OR "Series A" OR "Series B" OR "Series C"`, null);
+    if (results === null) { failed++; continue; }
+    let best = null;
+    for (const r of results) {
+      const h = parseHeadline(r.title, r.snippet, { allowLate: true });
+      if (!h) continue;
+      const hk = keyOf(h.name);
+      if (!(hk === key || hk.startsWith(key) || key.startsWith(hk))) continue; // headline must be about this company
+      const year = yearOf(r.link, r.title);
+      if (!best || (year || 0) > (best.announced_year || 0)) best = { ...h, announced_year: year, headline: r.title, source_url: r.link };
+    }
+    if (best) { withStage++; log(`   ✔ ${name}: ${best.stage}${best.announced_year ? ` (${best.announced_year})` : ''}`); }
+    else { unknown++; }
+    out.push({
+      name, name_key: key, source: 'enrich', lookups: 1, last_lookup_at: new Date().toISOString(),
+      stage: best ? best.stage : 'unknown', amount_usd: best ? best.amount_usd : null,
+      announced_year: best ? best.announced_year : null, headline: best ? best.headline : null,
+      source_url: best && !/^https?:\/\/(www\.)?google\./i.test(best.source_url || '') ? best.source_url : null,
+    });
+  }
+  log(`✅ Funding stage found for ${withStage}, nothing found for ${unknown}, ${failed} searches failed${DRY_RUN ? ' (dry run, nothing saved)' : ''}`);
+  if (failed === todo.length && todo.length > 0) {
+    const msg = `All ${failed} enrich searches failed (see view api_quota_status)`;
+    await logRun(supabase, 'discover-funded-startups', { errors: failed, notes: msg });
+    throw new Error(msg);
+  }
+  if (DRY_RUN) return;
+  if (out.length) {
+    const { error: e2 } = await supabase.from('funded_startups').upsert(out, { onConflict: 'name_key', ignoreDuplicates: true });
+    if (e2) throw new Error(`Saving enrich results failed: ${e2.message}`);
+  }
+  await logRun(supabase, 'discover-funded-startups', { found: withStage, inserted: out.length, errors: failed, notes: `mode=enrich providers=${JSON.stringify(searcher.used)}` });
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -116,12 +184,14 @@ async function main() {
     await logRun(supabase, 'discover-funded-startups', { errors: 1, notes: msg });
     throw new Error(msg);
   }
-  log(`🚀 Funded-startup discovery via ${searcher.providers.join('>')} — window ${WINDOW}${DRY_RUN ? ' (DRY RUN)' : ''}`);
+  if (MODE === 'enrich') return enrich(supabase, searcher);
+  const QUERIES = MODE === 'backfill' ? BACKFILL_QUERIES : FUNDING_QUERIES;
+  log(`🚀 Funded-startup discovery (${MODE}) via ${searcher.providers.join('>')} — window ${WINDOW}${DRY_RUN ? ' (DRY RUN)' : ''}`);
 
   // 1. Funding headlines
   const found = new Map();
   let failed = 0;
-  for (const q of FUNDING_QUERIES) {
+  for (const q of QUERIES) {
     const results = await searcher.search(q, NEWS_DOMAINS);
     if (results === null) { failed++; continue; }
     let kept = 0;
@@ -130,12 +200,12 @@ async function main() {
       if (!h) continue;
       const k = keyOf(h.name);
       if (k.length < 3 || found.has(k)) continue;
-      found.set(k, { ...h, name_key: k, headline: r.title, source_url: /^https?:\/\/(www\.)?google\./i.test(r.link || '') ? null : r.link });
+      found.set(k, { ...h, name_key: k, source: MODE === 'backfill' ? 'backfill' : 'news', announced_year: yearOf(r.link, r.title) || (WINDOW === 'y' || WINDOW === 'a' ? null : new Date().getFullYear()), headline: r.title, source_url: /^https?:\/\/(www\.)?google\./i.test(r.link || '') ? null : r.link });
       kept++;
     }
     log(`  "${q}": ${results.length} result(s), ${kept} new company(ies)`);
   }
-  if (failed === FUNDING_QUERIES.length) {
+  if (failed === QUERIES.length) {
     const msg = `All ${failed} funding searches failed (keys wrong or free budgets used up: see view api_quota_status)`;
     await logRun(supabase, 'discover-funded-startups', { errors: failed, notes: msg });
     throw new Error(msg);
@@ -197,7 +267,7 @@ async function main() {
   }
 }
 
-module.exports = { parseHeadline, boardFromResults, stageOf };
+module.exports = { parseHeadline, boardFromResults, stageOf, yearOf };
 
 if (require.main === module) {
   main().catch(err => { log(`💥 Fatal: ${err.message}`); process.exit(1); });

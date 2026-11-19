@@ -1,7 +1,8 @@
 name: Job Autopilot - Discover Jobs (Web Search)
 
 # Searches the ATS job boards (Ashby, Greenhouse, Lever, Workable, SmartRecruiters...)
-# for target titles through Serper.dev (or SerpApi as a fallback).
+# for target titles through Tavily, SerpApi and Serper, in that order, using only free credits
+# (counted in Supabase view api_quota_status; each stops before its free limit).
 # Runs Mon/Thu with a past-week window, so nothing falls between runs and
 # monthly search usage stays low (~104 searches).
 # The old Google Custom Search API returns 403 and is being retired.
@@ -42,6 +43,7 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
           SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
           SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}

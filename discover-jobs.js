@@ -5,6 +5,7 @@
  */
 
 const { createClient } = require('@supabase/supabase-js');
+const { spend } = require('./lib/quota');
 const { scoreJob } = require('./lib/scoring');
 const { guessAtsType, guessCompanySlug, looksLikeJobUrl } = require('./lib/url-capture');
 const { logRun } = require('./lib/runlog');
@@ -214,7 +215,8 @@ async function fetchSerpApi() {
   for (const query of serpQueries) {
     try {
       const params = new URLSearchParams({ engine: 'google_jobs', q: query, chips: 'date_posted:week', api_key: SERPAPI_KEY });
-      const res = await fetch(`https://serpapi.com/search?${params}`, { signal: AbortSignal.timeout(15000) });
+      if (!(await spend(supabase, 'serpapi'))) { log('  ⏭ SerpApi monthly free budget used up, skipping'); break; }
+        const res = await fetch(`https://serpapi.com/search?${params}`, { signal: AbortSignal.timeout(15000) });
       if (!res.ok) continue;
       const data = await res.json();
 
@@ -268,6 +270,7 @@ async function fetchSerpApiSiteSearch() {
       try {
         const q = `site:${domain} ${titleGroup}`;
         const params = new URLSearchParams({ engine: 'google', q, num: '20', api_key: SERPAPI_KEY });
+        if (!(await spend(supabase, 'serpapi'))) { log('  ⏭ SerpApi monthly free budget used up, skipping'); break; }
         const res = await fetch(`https://serpapi.com/search?${params}`, { signal: AbortSignal.timeout(15000) });
         if (!res.ok) continue;
         const data = await res.json();

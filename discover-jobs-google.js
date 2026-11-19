@@ -6,9 +6,11 @@
  * same idea — "search the ATS job boards for my target titles" — through a
  * search API that works:
  *
- *   1. Serper.dev  (SERPER_API_KEY)   — preferred. ~2,500 free queries on signup,
- *                                        then about $1 per 1,000.
- *   2. SerpApi     (SERPAPI_KEY)      — fallback, already used by discover-jobs.js.
+ *   1. Tavily   (TAVILY_API_KEY)  — 1,000 free credits/month, renews, no card.
+ *   2. SerpApi  (SERPAPI_KEY)     — 250 free/month, renews (shared with discover-jobs.js).
+ *   3. Serper   (SERPER_API_KEY)  — 2,500 one-time credits, never renew; spent last.
+ *   Budgets are tracked in Supabase (view api_quota_status) and every call stops
+ *   before the free limit, so nothing is ever billed.
  *
  * Each query is: (site:board1 OR site:board2 ...) "title" (remote OR Bay Area terms)
  * limited to the past 24 hours by default (SEARCH_WINDOW=d|w|m), so every run mostly returns new postings.
@@ -17,7 +19,7 @@
  *
  * Env vars:
  *   SUPABASE_URL, SUPABASE_ANON_KEY
- *   SERPER_API_KEY  and/or  SERPAPI_KEY
+ *   TAVILY_API_KEY, SERPAPI_KEY, SERPER_API_KEY  (any one or more)
  *   QUERIES_PER_RUN  (optional, default 12)
  *   DRY_RUN=true     (optional: print matches, write nothing)
  */
@@ -26,11 +28,13 @@ const { createClient } = require('@supabase/supabase-js');
 const { scoreJob } = require('./lib/scoring');
 const { guessAtsType, guessCompanySlug, looksLikeJobUrl } = require('./lib/url-capture');
 const { logRun } = require('./lib/runlog');
+const { spend } = require('./lib/quota');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const SERPER_API_KEY = process.env.SERPER_API_KEY;
 const SERPAPI_KEY = process.env.SERPAPI_KEY;
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 const QUERIES_PER_RUN = parseInt(process.env.QUERIES_PER_RUN || '12', 10);
 // Time window for results: d = past 24 hours (default), w = past week, m = past month
 const WINDOW = ['d','w','m'].includes(process.env.SEARCH_WINDOW) ? process.env.SEARCH_WINDOW : 'd';
@@ -129,8 +133,59 @@ async function searchSerpApi(q) {
   }
 }
 
-const search = SERPER_API_KEY ? searchSerper : SERPAPI_KEY ? searchSerpApi : null;
-const PROVIDER = SERPER_API_KEY ? 'serper' : SERPAPI_KEY ? 'serpapi' : 'none';
+async function searchTavily(q, term) {
+  try {
+    const range = { d: 'day', w: 'week', m: 'month' }[WINDOW];
+    const res = await fetch('https://api.tavily.com/search', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TAVILY_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query: `${term} job (remote OR "San Francisco" OR "Bay Area")`,
+        include_domains: BOARDS,
+        time_range: range,
+        search_depth: 'basic',
+        max_results: 20,
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!res.ok) {
+      log(`  ⚠ Tavily error ${res.status}: ${(await res.text().catch(() => '')).slice(0, 200)}`);
+      return null;
+    }
+    const data = await res.json();
+    return (data.results || []).map(r => ({ title: r.title, link: r.url, snippet: r.content }));
+  } catch (e) {
+    log(`  ⚠ Tavily fetch failed: ${e.message}`);
+    return null;
+  }
+}
+
+// Spend order: monthly-renewing free credits first (use-it-or-lose-it), the
+// one-time credits last so they last as long as possible. Every call is counted
+// in Supabase (api_quota) and stops before the free limit, so nothing is billed.
+const PROVIDERS = [
+  { name: 'tavily',  key: TAVILY_API_KEY, fn: searchTavily },
+  { name: 'serpapi', key: SERPAPI_KEY,    fn: searchSerpApi },
+  { name: 'serper',  key: SERPER_API_KEY, fn: searchSerper },
+].filter(p => p.key);
+const used = {};
+const exhausted = new Set();
+
+/** Runs one query on the first provider that has a key, free budget left, and works. */
+async function search(q, term) {
+  for (const p of PROVIDERS) {
+    if (exhausted.has(p.name)) continue;
+    if (!(await spend(supabase, p.name))) {
+      log(`  ⏭ ${p.name}: free budget used up, trying the next provider`);
+      exhausted.add(p.name);
+      continue;
+    }
+    const results = await p.fn(q, term);
+    if (results !== null) { used[p.name] = (used[p.name] || 0) + 1; return results; }
+  }
+  return null;
+}
+const PROVIDER = PROVIDERS.map(p => p.name).join('>') || 'none';
 
 // ── Turn a search hit into a job candidate ───────────────────────────────────
 
@@ -229,8 +284,8 @@ async function insertJobs(jobs) {
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-  if (!search) {
-    const msg = 'No search API key set: add SERPER_API_KEY (preferred) or SERPAPI_KEY as a GitHub secret';
+  if (PROVIDERS.length === 0) {
+    const msg = 'No search API key set: add TAVILY_API_KEY, SERPER_API_KEY or SERPAPI_KEY as a GitHub secret';
     log(`❌ ${msg}`);
     await logRun(supabase, 'discover-jobs-google', { errors: 1, notes: msg });
     throw new Error(msg);
@@ -244,7 +299,7 @@ async function main() {
 
   for (const term of terms) {
     const q = `${SITE_CLAUSE} ${term} ${PLACE_CLAUSE}`;
-    const results = await search(q);
+    const results = await search(q, term);
     if (results === null) { failed++; await sleep(800); continue; }
 
     let kept = 0;
@@ -266,7 +321,7 @@ async function main() {
 
   // Fail loudly: a run where every query failed must not look green.
   if (failed === terms.length) {
-    const msg = `All ${terms.length} searches failed via ${PROVIDER} (check the API key and plan)`;
+    const msg = `All ${terms.length} searches failed via ${PROVIDER} (keys wrong, or every free budget used up: see view api_quota_status)`;
     await logRun(supabase, 'discover-jobs-google', { errors: failed, notes: msg });
     throw new Error(msg);
   }
@@ -284,7 +339,7 @@ async function main() {
   const { inserted, archived } = await insertJobs(unique);
   log(`✅ Queued ${inserted} new jobs, archived ${archived} lower-score jobs`);
   await logRun(supabase, 'discover-jobs-google', {
-    found: unique.length, inserted, archived, errors: failed, notes: `provider=${PROVIDER} window=${WINDOW}`,
+    found: unique.length, inserted, archived, errors: failed, notes: `providers=${JSON.stringify(used)} window=${WINDOW}`,
   });
 }
 

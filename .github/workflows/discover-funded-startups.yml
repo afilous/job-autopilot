@@ -1,0 +1,52 @@
+name: Job Autopilot - Discover Funded Startups
+
+# Finds startups that just raised seed / pre-seed / Series A-B from funding news,
+# finds their job boards, and adds them to the daily ATS scan. Runs just before
+# the ATS discovery (16:00 UTC) so a new board is scanned the same day.
+# Free: uses the same free search credits as the web-search workflow.
+
+on:
+  schedule:
+    - cron: "45 15 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run: print what was found, write nothing to Supabase'
+        required: false
+        default: false
+        type: boolean
+      search_window:
+        description: 'Time window: d = past 24 hours, w = past week, m = past month'
+        required: false
+        default: 'w'
+      max_lookups:
+        description: 'Max companies to look up job boards for'
+        required: false
+        default: '25'
+
+jobs:
+  discover-funded:
+    name: Discover funded startups
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: npm install
+
+      - name: Run funded-startup discovery
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          BRIGHTDATA_API_KEY: ${{ secrets.BRIGHTDATA_API_KEY }}
+          BRIGHTDATA_ZONE: ${{ secrets.BRIGHTDATA_ZONE }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          SEARCH_WINDOW: ${{ github.event.inputs.search_window || 'd' }}
+          MAX_LOOKUPS: ${{ github.event.inputs.max_lookups || '25' }}
+        run: node discover-funded-startups.js

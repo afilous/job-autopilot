@@ -31,15 +31,10 @@ const { createClient } = require('@supabase/supabase-js');
 const { scoreJob } = require('./lib/scoring');
 const { guessAtsType, guessCompanySlug, looksLikeJobUrl } = require('./lib/url-capture');
 const { logRun } = require('./lib/runlog');
-const { spend } = require('./lib/quota');
+const { createSearcher } = require('./lib/search');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
-const SERPER_API_KEY = process.env.SERPER_API_KEY;
-const SERPAPI_KEY = process.env.SERPAPI_KEY;
-const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
-const BRIGHTDATA_API_KEY = process.env.BRIGHTDATA_API_KEY;
-const BRIGHTDATA_ZONE = process.env.BRIGHTDATA_ZONE;
 const QUERIES_PER_RUN = parseInt(process.env.QUERIES_PER_RUN || '16', 10);
 // Time window for results: d = past 24 hours (default), w = past week, m = past month
 const WINDOW = ['d','w','m'].includes(process.env.SEARCH_WINDOW) ? process.env.SEARCH_WINDOW : 'd';
@@ -62,7 +57,6 @@ const BOARDS = [
   'jobs.gem.com',
   'jobs.breezy.hr',
 ];
-const SITE_CLAUSE = '(' + BOARDS.map(b => `site:${b}`).join(' OR ') + ')';
 
 // Location words that keep results to Bay Area / remote-US postings.
 const PLACE_CLAUSE = '(remote OR "San Francisco" OR "Bay Area" OR "San Jose" OR "Palo Alto" OR "Oakland")';
@@ -95,150 +89,10 @@ function pickTermsForToday() {
   return rotated.slice(0, Math.min(QUERIES_PER_RUN, SEARCH_TERMS.length));
 }
 
-// ── Search providers ─────────────────────────────────────────────────────────
-// Each returns an array of { title, link, snippet } or null on failure.
+// ── Search providers (shared layer: lib/search.js) ───────────────────────────
 
-async function searchSerper(q) {
-  try {
-    const res = await fetch('https://google.serper.dev/search', {
-      method: 'POST',
-      headers: { 'X-API-KEY': SERPER_API_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ q, num: 20, gl: 'us', hl: 'en', tbs: `qdr:${WINDOW}` }),
-      signal: AbortSignal.timeout(20000),
-    });
-    if (!res.ok) {
-      log(`  ⚠ Serper error ${res.status}: ${(await res.text().catch(() => '')).slice(0, 200)}`);
-      return null;
-    }
-    const data = await res.json();
-    return (data.organic || []).map(r => ({ title: r.title, link: r.link, snippet: r.snippet }));
-  } catch (e) {
-    log(`  ⚠ Serper fetch failed: ${e.message}`);
-    return null;
-  }
-}
-
-async function searchSerpApi(q) {
-  try {
-    const params = new URLSearchParams({ engine: 'google', q, num: '20', tbs: `qdr:${WINDOW}`, gl: 'us', hl: 'en', api_key: SERPAPI_KEY });
-    const res = await fetch(`https://serpapi.com/search.json?${params}`, { signal: AbortSignal.timeout(25000) });
-    if (!res.ok) {
-      log(`  ⚠ SerpApi error ${res.status}: ${(await res.text().catch(() => '')).slice(0, 200)}`);
-      return null;
-    }
-    const data = await res.json();
-    if (data.error && !/hasn't returned any results/i.test(data.error)) {
-      log(`  ⚠ SerpApi: ${data.error}`);
-      return null;
-    }
-    return (data.organic_results || []).map(r => ({ title: r.title, link: r.link, snippet: r.snippet }));
-  } catch (e) {
-    log(`  ⚠ SerpApi fetch failed: ${e.message}`);
-    return null;
-  }
-}
-
-async function searchBrightData(q) {
-  try {
-    // Bright Data runs a real Google search and returns it parsed (brd_json=1).
-    // It returns 10 results per call. tbs (time filter) is a normal Google parameter.
-    const url = `https://www.google.com/search?${new URLSearchParams({ q, gl: 'us', hl: 'en', tbs: `qdr:${WINDOW}`, brd_json: '1' })}`;
-    const res = await fetch('https://api.brightdata.com/request', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${BRIGHTDATA_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ zone: BRIGHTDATA_ZONE, url, format: 'raw' }),
-      signal: AbortSignal.timeout(60000),
-    });
-    if (!res.ok) {
-      log(`  ⚠ Bright Data error ${res.status}: ${(await res.text().catch(() => '')).slice(0, 200)}`);
-      return null;
-    }
-    const text = await res.text();
-    if (!text.trim()) { log('  ⚠ Bright Data returned an empty response (trying the next provider)'); return null; }
-    const data = JSON.parse(text);
-    return (data.organic || []).map(r => ({ title: r.title, link: r.link, snippet: r.description }));
-  } catch (e) {
-    log(`  ⚠ Bright Data fetch failed: ${e.message}`);
-    return null;
-  }
-}
-
-async function searchTavily(q, term) {
-  try {
-    const range = { d: 'day', w: 'week', m: 'month' }[WINDOW];
-    const res = await fetch('https://api.tavily.com/search', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${TAVILY_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        query: `${term} job (remote OR "San Francisco" OR "Bay Area")`,
-        include_domains: BOARDS,
-        time_range: range,
-        search_depth: 'basic',
-        max_results: 20,
-      }),
-      signal: AbortSignal.timeout(30000),
-    });
-    if (!res.ok) {
-      log(`  ⚠ Tavily error ${res.status}: ${(await res.text().catch(() => '')).slice(0, 200)}`);
-      return null;
-    }
-    const data = await res.json();
-    return (data.results || []).map(r => ({ title: r.title, link: r.url, snippet: r.content }));
-  } catch (e) {
-    log(`  ⚠ Tavily fetch failed: ${e.message}`);
-    return null;
-  }
-}
-
-// Providers come in two groups, all on free credits only. Every call is counted
-// in Supabase (api_quota) and stops before the free limit, so nothing is billed.
-//   combine: monthly-renewing credits. Every query goes to ALL of these and the
-//            results are merged (different engines surface different postings).
-//   backup:  SerpApi (small, shared) and Serper (one-time credits that never
-//            renew). Used only when every "combine" provider failed.
-const PROVIDERS = [
-  { name: 'tavily',     key: TAVILY_API_KEY,                          fn: searchTavily,     combine: true },
-  { name: 'brightdata', key: BRIGHTDATA_API_KEY && BRIGHTDATA_ZONE,   fn: searchBrightData, combine: true },
-  { name: 'serpapi',    key: SERPAPI_KEY,                             fn: searchSerpApi,    combine: false },
-  { name: 'serper',     key: SERPER_API_KEY,                          fn: searchSerper,     combine: false },
-].filter(p => p.key);
-const used = {};
-const exhausted = new Set();
-
-async function callProvider(p, q, term) {
-  if (exhausted.has(p.name)) return null;
-  if (!(await spend(supabase, p.name))) {
-    log(`  ⏭ ${p.name}: free budget used up`);
-    exhausted.add(p.name);
-    return null;
-  }
-  const results = await p.fn(q, term);
-  if (results !== null) used[p.name] = (used[p.name] || 0) + 1;
-  return results;
-}
-
-/** Runs one query on every "combine" provider and merges; falls back to the backups. */
-async function search(q, term) {
-  const merged = [];
-  const seen = new Set();
-  let anyWorked = false;
-  for (const p of PROVIDERS.filter(x => x.combine)) {
-    const results = await callProvider(p, q, term);
-    if (results === null) continue;
-    anyWorked = true;
-    for (const r of results) {
-      const key = String(r.link || '').replace(/^http:/, 'https:').replace(/[?#].*$/, '').replace(/\/$/, '').toLowerCase();
-      if (key && !seen.has(key)) { seen.add(key); merged.push(r); }
-    }
-  }
-  if (anyWorked) return merged;
-  for (const p of PROVIDERS.filter(x => !x.combine)) {
-    const results = await callProvider(p, q, term);
-    if (results !== null) return results;
-  }
-  return null;
-}
-const PROVIDER = PROVIDERS.map(p => p.name).join('+') || 'none';
+const searcher = createSearcher({ supabase, window: WINDOW, mode: 'merge', log });
+const PROVIDER = searcher.providers.join('+') || 'none';
 
 // ── Turn a search hit into a job candidate ───────────────────────────────────
 
@@ -337,7 +191,7 @@ async function insertJobs(jobs) {
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-  if (PROVIDERS.length === 0) {
+  if (searcher.providers.length === 0) {
     const msg = 'No search API key set: add BRIGHTDATA_API_KEY + BRIGHTDATA_ZONE, TAVILY_API_KEY, SERPER_API_KEY or SERPAPI_KEY as a GitHub secret';
     log(`❌ ${msg}`);
     await logRun(supabase, 'discover-jobs-google', { errors: 1, notes: msg });
@@ -351,8 +205,7 @@ async function main() {
   let failed = 0;
 
   for (const term of terms) {
-    const q = `${SITE_CLAUSE} ${term} ${PLACE_CLAUSE}`;
-    const results = await search(q, term);
+    const results = await searcher.search(`${term} ${PLACE_CLAUSE}`, BOARDS);
     if (results === null) { failed++; await sleep(800); continue; }
 
     let kept = 0;
@@ -392,7 +245,7 @@ async function main() {
   const { inserted, archived } = await insertJobs(unique);
   log(`✅ Queued ${inserted} new jobs, archived ${archived} lower-score jobs`);
   await logRun(supabase, 'discover-jobs-google', {
-    found: unique.length, inserted, archived, errors: failed, notes: `providers=${JSON.stringify(used)} window=${WINDOW}`,
+    found: unique.length, inserted, archived, errors: failed, notes: `providers=${JSON.stringify(searcher.used)} window=${WINDOW}`,
   });
 }
 

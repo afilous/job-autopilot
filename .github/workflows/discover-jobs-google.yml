@@ -1,15 +1,17 @@
 name: Job Autopilot - Discover Jobs (Web Search)
 
 # Searches the ATS job boards (Ashby, Greenhouse, Lever, Workable, SmartRecruiters...)
-# for target titles through Bright Data, Tavily, SerpApi and Serper, in that order, using only free credits
-# (counted in Supabase view api_quota_status; each stops before its free limit).
-# Runs Mon/Thu with a past-week window, so nothing falls between runs and
-# monthly search usage stays low (~145 searches per provider).
+# for target titles. Every query goes to Tavily and Bright Data and the results are
+# merged; SerpApi and Serper are backups. Free credits only (counted in Supabase
+# view api_quota_status; each provider stops before its free limit).
+# Runs daily on a past-24-hours window (about 480 searches a month on each of
+# Tavily and Bright Data, well inside their free limits), so new postings are
+# seen the day they appear. Manual runs default to the past week.
 # The old Google Custom Search API returns 403 and is being retired.
 
 on:
   schedule:
-    - cron: "0 16 * * 1,4"
+    - cron: "0 16 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -49,6 +51,6 @@ jobs:
           SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
           SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
-          SEARCH_WINDOW: ${{ github.event.inputs.search_window || 'w' }}
+          SEARCH_WINDOW: ${{ github.event.inputs.search_window || 'd' }}
           QUERIES_PER_RUN: ${{ github.event.inputs.queries_per_run || '12' }}
         run: node discover-jobs-google.js

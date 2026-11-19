@@ -5,8 +5,10 @@
  */
 
 const { createClient } = require('@supabase/supabase-js');
+const { spend } = require('./lib/quota');
 const { scoreJob } = require('./lib/scoring');
 const { guessAtsType, guessCompanySlug, looksLikeJobUrl } = require('./lib/url-capture');
+const { logRun } = require('./lib/runlog');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
@@ -28,9 +30,15 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── Generic ATS URL parsing ───────────────────────────────────────────────────
+// ── URL parsing + "best link" ranking ─────────────────────────────────────────
+// Search APIs return several apply links per job (job board, Google, employer
+// ATS). Rank them so the employer's own ATS link wins; Tsenta needs that link.
+// Job-board / aggregator links are kept only as a last-resort fallback.
+
+const AGGREGATOR_RE = /(linkedin|indeed|ziprecruiter|theladders|jobleads|bebee|builtin|glassdoor|themuse|mediabistro|careerbuilder|monster|talent\.com|jooble|adzuna|learn4good|simplyhired|dice\.com|snagajob|whatjobs|jobrapido|lensa|jobtarget|remotive|weworkremotely|joinrise|cazvid|trueup|wellfound|google\.com|salary\.com|ladders|recruit\.net|jobsora|jobilize|talentify|nexxt|jora|career\.com|efinancialcareers|powertofly|workopolis|swooped|jobgether)/i;
 
 function parseJobUrl(url) {
+  if (!url || typeof url !== 'string') return null;
   if (!looksLikeJobUrl(url)) return null;
   return {
     ats_type: guessAtsType(url),
@@ -38,6 +46,25 @@ function parseJobUrl(url) {
     url: url.split('?')[0],
   };
 }
+
+// Pick the best link from a list of candidates:
+//   1) a recognized ATS link (Greenhouse, Lever, Ashby, Workday, ...)
+//   2) a company-hosted link that is not a known job board
+//   3) any job-board link (marked needs-link downstream)
+function bestAtsInfo(candidateUrls) {
+  const parsed = [];
+  const seenUrls = new Set();
+  for (const u of candidateUrls) {
+    const info = parseJobUrl(u);
+    if (info && !seenUrls.has(info.url)) { seenUrls.add(info.url); parsed.push(info); }
+  }
+  return parsed.find(p => p.ats_type !== 'unknown')
+      || parsed.find(p => !AGGREGATOR_RE.test(p.url))
+      || parsed[0]
+      || null;
+}
+
+function isDirectAts(job) { return job.ats_type && job.ats_type !== 'unknown'; }
 
 // ── Search queries (Adzuna) ────────────────────────────────────────────────────
 
@@ -66,6 +93,18 @@ const QUERIES = [
 
 // ── Adzuna ────────────────────────────────────────────────────────────────────
 
+
+// ── Paid-quota guard ──────────────────────────────────────────────────────────
+// JSearch and SerpApi have small monthly free quotas. Their searches look back a
+// full week, so they only need to run every other day. By default they run on
+// Mon / Thu (UTC weekday numbers 1 and 4). Manual "Run workflow" clicks
+// always run. Override with SEARCH_API_DAYS="1,2,3,4,5" to run more often.
+function searchApisDueToday() {
+  if (process.env.GITHUB_EVENT_NAME === 'workflow_dispatch') return true;
+  const days = String(process.env.SEARCH_API_DAYS || '1,4').split(',').map(d => parseInt(d, 10));
+  return days.includes(new Date().getUTCDay());
+}
+
 async function fetchAdzuna() {
   if (!ADZUNA_APP_ID || !ADZUNA_APP_KEY) { log('⏭ Adzuna: no credentials'); return []; }
   log('🔍 Adzuna: fetching jobs...');
@@ -82,13 +121,8 @@ async function fetchAdzuna() {
       const data = await res.json();
 
       for (const job of (data.results || [])) {
-        const candidateUrls = [job.redirect_url, job.adref, job.apply_url].filter(Boolean);
-        let atsInfo = null;
-        for (const u of candidateUrls) { atsInfo = parseJobUrl(u); if (atsInfo) break; }
-        if (!atsInfo && job.description) {
-          const urlMatches = job.description.match(/https?:\/\/[^\s"'<>]+/g) || [];
-          for (const u of urlMatches) { atsInfo = parseJobUrl(u); if (atsInfo) break; }
-        }
+        const descUrls = job.description ? (job.description.match(/https?:\/\/[^\s"'<>]+/g) || []) : [];
+        const atsInfo = bestAtsInfo([job.redirect_url, job.adref, job.apply_url, ...descUrls]);
         if (!atsInfo) continue;
 
         const title = job.title || '';
@@ -112,6 +146,7 @@ async function fetchAdzuna() {
 
 async function fetchJSearch() {
   if (!JSEARCH_API_KEY) { log('⏭ JSearch: no credentials'); return []; }
+  if (!searchApisDueToday()) { log('⏭ JSearch: skipped today (runs Mon/Thu to save quota)'); return []; }
   log('🔍 JSearch: fetching jobs...');
   const jobs = [];
 
@@ -135,9 +170,14 @@ async function fetchJSearch() {
       const data = await res.json();
 
       for (const job of (data.data || [])) {
-        const candidateUrls = [job.job_apply_link, job.job_google_link, job.job_url, ...(job.apply_options||[]).map(o=>o.apply_link)].filter(Boolean);
-        let atsInfo = null;
-        for (const u of candidateUrls) { atsInfo = parseJobUrl(u); if (atsInfo) break; }
+        const opts = job.apply_options || [];
+        const candidateUrls = [
+          ...opts.filter(o => o.is_direct).map(o => o.apply_link),
+          job.job_apply_link,
+          ...opts.map(o => o.apply_link),
+          job.job_google_link, job.job_url,
+        ].filter(Boolean);
+        const atsInfo = bestAtsInfo(candidateUrls);
         if (!atsInfo) continue;
 
         const title = job.job_title || '';
@@ -161,6 +201,7 @@ async function fetchJSearch() {
 
 async function fetchSerpApi() {
   if (!SERPAPI_KEY) { log('⏭ SerpApi: no credentials'); return []; }
+  if (!searchApisDueToday()) { log('⏭ SerpApi: skipped today (runs Mon/Thu to save quota)'); return []; }
   log('🔍 SerpApi: fetching jobs...');
   const jobs = [];
 
@@ -174,15 +215,14 @@ async function fetchSerpApi() {
   for (const query of serpQueries) {
     try {
       const params = new URLSearchParams({ engine: 'google_jobs', q: query, chips: 'date_posted:week', api_key: SERPAPI_KEY });
-      const res = await fetch(`https://serpapi.com/search?${params}`, { signal: AbortSignal.timeout(15000) });
+      if (!(await spend(supabase, 'serpapi'))) { log('  ⏭ SerpApi monthly free budget used up, skipping'); break; }
+        const res = await fetch(`https://serpapi.com/search?${params}`, { signal: AbortSignal.timeout(15000) });
       if (!res.ok) continue;
       const data = await res.json();
 
       for (const job of (data.jobs_results || [])) {
         const applyLinks = (job.apply_options||[]).map(o=>o.link);
-        const candidateUrls = [job.job_id, ...applyLinks].filter(Boolean);
-        let atsInfo = null;
-        for (const u of candidateUrls) { atsInfo = parseJobUrl(u); if (atsInfo) break; }
+        const atsInfo = bestAtsInfo([...applyLinks, job.share_link, job.related_links?.[0]?.link].filter(Boolean));
         if (!atsInfo) continue;
 
         const title = job.title || '';
@@ -230,6 +270,7 @@ async function fetchSerpApiSiteSearch() {
       try {
         const q = `site:${domain} ${titleGroup}`;
         const params = new URLSearchParams({ engine: 'google', q, num: '20', api_key: SERPAPI_KEY });
+        if (!(await spend(supabase, 'serpapi'))) { log('  ⏭ SerpApi monthly free budget used up, skipping'); break; }
         const res = await fetch(`https://serpapi.com/search?${params}`, { signal: AbortSignal.timeout(15000) });
         if (!res.ok) continue;
         const data = await res.json();
@@ -255,6 +296,79 @@ async function fetchSerpApiSiteSearch() {
 
   log(`✅ SerpApi site search: ${jobs.length} relevant ATS jobs`);
   return jobs;
+}
+
+// ── Same job, many links: dedupe by company + title ───────────────────────────
+// The same posting often comes back from several boards. Keep one row per
+// company+title, preferring the direct ATS link and then the higher score.
+
+function normCompany(c) {
+  return String(c || '').toLowerCase()
+    .replace(/&amp;/g, '&')
+    .replace(/\b(inc|llc|corp|corporation|co|ltd|limited|usa|us|holdings)\b\.?/g, '')
+    .replace(/[^a-z0-9]/g, '');
+}
+function normTitle(t) {
+  return String(t || '').toLowerCase().replace(/&amp;/g, '&').replace(/[^a-z0-9&]/g, '');
+}
+function jobKey(j) { return `${normCompany(j.company)}|${normTitle(j.job_title)}`; }
+
+function dedupeByCompanyTitle(jobs) {
+  const best = new Map();
+  for (const j of jobs) {
+    const k = jobKey(j);
+    const cur = best.get(k);
+    if (!cur) { best.set(k, j); continue; }
+    const better = (isDirectAts(j) && !isDirectAts(cur))
+      || (isDirectAts(j) === isDirectAts(cur) && j.match_score > cur.match_score);
+    if (better) best.set(k, j);
+  }
+  return [...best.values()];
+}
+
+// Drop jobs whose company+title is already in the database under any link.
+async function dropKnownCompanyTitles(jobs) {
+  if (jobs.length === 0) return jobs;
+  const titles = [...new Set(jobs.map(j => j.job_title).filter(Boolean))];
+  const known = new Set();
+  const CHUNK = 100;
+  for (let i = 0; i < titles.length; i += CHUNK) {
+    const { data, error } = await supabase
+      .from('applications').select('company, job_title')
+      .in('job_title', titles.slice(i, i + CHUNK));
+    if (error) { log(`  ⚠ company/title lookup failed: ${error.message}`); return jobs; }
+    for (const r of data || []) known.add(jobKey(r));
+  }
+  const kept = jobs.filter(j => !known.has(jobKey(j)));
+  log(`   Dropped ${jobs.length - kept.length} jobs already in the database under another link`);
+  return kept;
+}
+
+// ── Feed the company list ─────────────────────────────────────────────────────
+// Every direct Greenhouse/Lever/Ashby/Workable/SmartRecruiters link we find
+// tells us a company's board slug. Save it so discover-jobs-api.js polls that
+// company's whole board every day, not just the one posting we happened to see.
+
+const BOARD_ATS = new Set(['greenhouse', 'lever', 'ashby', 'workable', 'smartrecruiters']);
+const BAD_SLUGS = new Set(['jobs', 'job', 'view', 'embed', 'apply', 'j', 'careers', 'career', 'o', 'p', 'www', 'unknown', 'postings', 'en']);
+
+function cap(s) { return s.replace(/[-_]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase()); }
+
+async function saveDiscoveredCompanies(jobs) {
+  const bySlug = new Map();
+  for (const j of jobs) {
+    if (!BOARD_ATS.has(j.ats_type)) continue;
+    if (/jobs\.workable\.com/i.test(j.url || '')) continue; // slug is not in this URL form
+    const slug = String(j.ats_slug || '').toLowerCase();
+    if (!/^[a-z0-9][a-z0-9_-]{1,60}$/.test(slug) || BAD_SLUGS.has(slug)) continue;
+    if (!bySlug.has(slug)) bySlug.set(slug, { name: cap(slug), ats_type: j.ats_type, ats_slug: slug, active: true });
+  }
+  const rows = [...bySlug.values()];
+  if (rows.length === 0) return 0;
+  const { data, error } = await supabase.from('companies')
+    .upsert(rows, { onConflict: 'ats_slug', ignoreDuplicates: true }).select('ats_slug');
+  if (error) { log(`  ⚠ Saving discovered companies failed: ${error.message}`); return 0; }
+  return (data || []).length;
 }
 
 // ── Insert jobs ───────────────────────────────────────────────────────────────
@@ -320,10 +434,19 @@ async function main() {
 
   const allJobs = [...adzunaJobs, ...jsearchJobs, ...serpApiJobs, ...siteSearchJobs];
   const seen = new Set();
-  const uniqueJobs = allJobs.filter(j => {
+  const urlUnique = allJobs.filter(j => {
     if (!j.url || seen.has(j.url)) return false;
     seen.add(j.url); return true;
   });
+
+  // Companies first: even a duplicate posting teaches us a new board slug.
+  const newCompanies = await saveDiscoveredCompanies(urlUnique);
+  log(`🏢 Added ${newCompanies} new companies to the daily board list`);
+
+  const directCount = urlUnique.filter(isDirectAts).length;
+  log(`🔗 Links found: ${directCount} direct ATS, ${urlUnique.length - directCount} job-board only`);
+
+  const uniqueJobs = await dropKnownCompanyTitles(dedupeByCompanyTitle(urlUnique));
 
   log(`\n📊 Scored jobs found: ${uniqueJobs.length}`);
   log(`   Score 90+: ${uniqueJobs.filter(j => j.match_score >= 90).length}`);
@@ -334,6 +457,7 @@ async function main() {
   log(`\n✅ Inserted ${inserted} new jobs into queue`);
   log(`🗄 Archived ${archived} low-score jobs`);
   log(`⏭ Skipped ${uniqueJobs.length - inserted - archived} already in database`);
+  await logRun(supabase, 'discover-jobs', { found: allJobs.length, inserted, archived, notes: `${directCount} direct ATS links, ${newCompanies} new companies` });
 }
 
-main().catch(err => { log(`💥 Fatal: ${err.message}`); process.exit(1); });
+main().catch(async err => { log(`💥 Fatal: ${err.message}`); await logRun(supabase, 'discover-jobs', { errors: 1, notes: err.message }); process.exit(1); });

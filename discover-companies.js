@@ -27,6 +27,7 @@
  */
 
 const { createClient } = require('@supabase/supabase-js');
+const { spend } = require('./lib/quota');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
@@ -177,6 +178,7 @@ async function siteSearch(domain, titleGroup) {
   try {
     const q = `site:${domain} ${titleGroup}`;
     const params = new URLSearchParams({ engine: 'google', q, num: '20', api_key: SERPAPI_KEY });
+    if (!(await spend(supabase, 'serpapi'))) { log('  ⏭ SerpApi monthly free budget used up, skipping'); return []; }
     const res = await fetch(`https://serpapi.com/search?${params}`, { signal: AbortSignal.timeout(15000) });
     if (!res.ok) { log(`  ⚠ SerpApi ${res.status} for site:${domain}`); return []; }
     const data = await res.json();

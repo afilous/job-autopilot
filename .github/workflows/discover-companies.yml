@@ -3,7 +3,7 @@ name: Job Autopilot — Discover Companies
 on:
   workflow_dispatch:  # manual trigger only
   schedule:
-    - cron: '0 6 * * 0'  # every Sunday 6am UTC = Saturday midnight PT
+    - cron: '0 6 1,15 * *'  # 1st and 15th of the month (twice a month saves SerpApi quota)
 
 jobs:
   discover:

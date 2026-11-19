@@ -1,241 +1,399 @@
 /**
- * Job Autopilot — Google Custom Search Job Discovery
- * Uses the free Custom Search JSON API (100 queries/day) against a
- * Programmable Search Engine scoped to 18 job-board/ATS domains
- * (jobs.ashbyhq.com, boards.greenhouse.io, *.myworkdayjobs.com, etc.)
+ * Job Autopilot — Site-scoped web search discovery
  *
- * Scores jobs at insert time using the same lib/scoring.js used by
- * discover-jobs-api.js, so Director exclusions, CoS stage-gating, and the
- * Strategic Finance rule all apply identically here.
+ * Google's Custom Search JSON API now returns 403 for this project (closed to
+ * new customers, being retired), so this script no longer uses it. It runs the
+ * same idea — "search the ATS job boards for my target titles" — through a
+ * search API that works:
  *
- * Env vars needed:
- *   SUPABASE_URL
- *   SUPABASE_ANON_KEY
- *   GOOGLE_SEARCH_API_KEY
- *   GOOGLE_SEARCH_ENGINE_ID   (the "cx" value)
+ *   Combined (every query goes to both, results merged and de-duplicated):
+ *     Tavily      (TAVILY_API_KEY)                      — 1,000 free credits/month
+ *     Bright Data (BRIGHTDATA_API_KEY + BRIGHTDATA_ZONE) — 5,000 free/month
+ *   Backup (only if both of the above fail):
+ *     SerpApi (SERPAPI_KEY) — 250 free/month, shared with discover-jobs.js
+ *     Serper  (SERPER_API_KEY) — 2,500 one-time credits, never renew
+ *   Budgets are tracked in Supabase (view api_quota_status) and every call stops
+ *   before the free limit, so nothing is ever billed.
+ *
+ * Each query is: (site:board1 OR site:board2 ...) "title" (remote OR Bay Area terms)
+ * limited to the past 24 hours by default (SEARCH_WINDOW=d|w|m), so every run mostly returns new postings.
+ * Results are scored with lib/scoring.js (same as every other source); the
+ * Supabase triggers then assign the fit tier.
+ *
+ * Env vars:
+ *   SUPABASE_URL, SUPABASE_ANON_KEY
+ *   TAVILY_API_KEY, SERPAPI_KEY, SERPER_API_KEY  (any one or more)
+ *   QUERIES_PER_RUN  (optional, default 12)
+ *   DRY_RUN=true     (optional: print matches, write nothing)
  */
 
 const { createClient } = require('@supabase/supabase-js');
 const { scoreJob } = require('./lib/scoring');
+const { guessAtsType, guessCompanySlug, looksLikeJobUrl } = require('./lib/url-capture');
+const { logRun } = require('./lib/runlog');
+const { spend } = require('./lib/quota');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
-const GOOGLE_SEARCH_API_KEY = process.env.GOOGLE_SEARCH_API_KEY;
-const GOOGLE_SEARCH_ENGINE_ID = process.env.GOOGLE_SEARCH_ENGINE_ID;
+const SERPER_API_KEY = process.env.SERPER_API_KEY;
+const SERPAPI_KEY = process.env.SERPAPI_KEY;
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
+const BRIGHTDATA_API_KEY = process.env.BRIGHTDATA_API_KEY;
+const BRIGHTDATA_ZONE = process.env.BRIGHTDATA_ZONE;
+const QUERIES_PER_RUN = parseInt(process.env.QUERIES_PER_RUN || '16', 10);
+// Time window for results: d = past 24 hours (default), w = past week, m = past month
+const WINDOW = ['d','w','m'].includes(process.env.SEARCH_WINDOW) ? process.env.SEARCH_WINDOW : 'd';
+const DRY_RUN = String(process.env.DRY_RUN || '').toLowerCase() === 'true';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── Rotating search terms ──────────────────────────────────────────────────
+// ── Where to search ──────────────────────────────────────────────────────────
+// Boards Tsenta can apply to directly.
+const BOARDS = [
+  'jobs.ashbyhq.com',
+  'boards.greenhouse.io',
+  'job-boards.greenhouse.io',
+  'jobs.lever.co',
+  'apply.workable.com',
+  'jobs.smartrecruiters.com',
+  'jobs.gem.com',
+  'jobs.breezy.hr',
+];
+const SITE_CLAUSE = '(' + BOARDS.map(b => `site:${b}`).join(' OR ') + ')';
+
+// Location words that keep results to Bay Area / remote-US postings.
+const PLACE_CLAUSE = '(remote OR "San Francisco" OR "Bay Area" OR "San Jose" OR "Palo Alto" OR "Oakland")';
+
+// ── Rotating search terms ────────────────────────────────────────────────────
 const SEARCH_TERMS = [
   '"chief of staff"',
+  '"head of operations"',
   '"business operations"',
-  '"strategy & operations"',
-  '"strategy and operations"',
-  '"revenue operations"',
-  '"business transformation"',
-  '"founders associate"',
-  '"founder\'s office"',
+  '"strategy & operations" OR "strategy and operations"',
+  '"strategy ops" OR "strategic operations" OR "ops & strategy"',
+  '"biz ops" OR "bizops"',
+  '"revenue operations" OR "revops"',
+  '"GTM operations" OR "go-to-market operations" OR "sales operations"',
+  '"partner operations" OR "partnerships operations"',
+  '"special projects" OR "founder\'s office" OR "founders associate"',
+  '"corporate strategy" OR "strategic planning" OR "business planning"',
+  '"program manager" operations',
+  '"operations manager"',
+  '"business transformation" OR "change management"',
   '"deal desk"',
-  '"GTM operations"',
-  '"biz ops"',
-  '"special projects"',
-  '"corporate strategy"',
-  '"strategic operations"',
-  '"revenue insights"',
-  '"forward deployed operations"',
-  '"sales strategy & operations"',
-  '"change management"',
-  '"business planning"',
-  '"strategic planning"',
+  '"forward deployed" operations',
 ];
-
-const QUERIES_PER_RUN = 15;
 
 function pickTermsForToday() {
   const start = new Date(new Date().getFullYear(), 0, 0);
-  const diff = Date.now() - start.getTime();
-  const dayOfYear = Math.floor(diff / (1000 * 60 * 60 * 24));
-
-  const rotated = [
-    ...SEARCH_TERMS.slice(dayOfYear % SEARCH_TERMS.length),
-    ...SEARCH_TERMS.slice(0, dayOfYear % SEARCH_TERMS.length),
-  ];
-  return rotated.slice(0, QUERIES_PER_RUN);
+  const dayOfYear = Math.floor((Date.now() - start.getTime()) / 86400000);
+  const offset = (dayOfYear * QUERIES_PER_RUN) % SEARCH_TERMS.length;
+  const rotated = [...SEARCH_TERMS.slice(offset), ...SEARCH_TERMS.slice(0, offset)];
+  return rotated.slice(0, Math.min(QUERIES_PER_RUN, SEARCH_TERMS.length));
 }
 
-// ── Google Custom Search API call ──────────────────────────────────────────
+// ── Search providers ─────────────────────────────────────────────────────────
+// Each returns an array of { title, link, snippet } or null on failure.
 
-async function searchGoogle(term) {
-  const url = new URL('https://www.googleapis.com/customsearch/v1');
-  url.searchParams.set('key', GOOGLE_SEARCH_API_KEY);
-  url.searchParams.set('cx', GOOGLE_SEARCH_ENGINE_ID);
-  url.searchParams.set('q', term);
-  url.searchParams.set('num', '10');
-
+async function searchSerper(q) {
   try {
-    const res = await fetch(url.toString(), { signal: AbortSignal.timeout(10000) });
+    const res = await fetch('https://google.serper.dev/search', {
+      method: 'POST',
+      headers: { 'X-API-KEY': SERPER_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ q, num: 20, gl: 'us', hl: 'en', tbs: `qdr:${WINDOW}` }),
+      signal: AbortSignal.timeout(20000),
+    });
     if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      log(`  ⚠ Google Search API error for "${term}": ${res.status} ${body.slice(0, 200)}`);
-      return [];
+      log(`  ⚠ Serper error ${res.status}: ${(await res.text().catch(() => '')).slice(0, 200)}`);
+      return null;
     }
     const data = await res.json();
-    return data.items || [];
+    return (data.organic || []).map(r => ({ title: r.title, link: r.link, snippet: r.snippet }));
   } catch (e) {
-    log(`  ⚠ Google Search API fetch failed for "${term}": ${e.message}`);
-    return [];
+    log(`  ⚠ Serper fetch failed: ${e.message}`);
+    return null;
   }
 }
 
-// ── Parse a search result into a job candidate ─────────────────────────────
+async function searchSerpApi(q) {
+  try {
+    const params = new URLSearchParams({ engine: 'google', q, num: '20', tbs: `qdr:${WINDOW}`, gl: 'us', hl: 'en', api_key: SERPAPI_KEY });
+    const res = await fetch(`https://serpapi.com/search.json?${params}`, { signal: AbortSignal.timeout(25000) });
+    if (!res.ok) {
+      log(`  ⚠ SerpApi error ${res.status}: ${(await res.text().catch(() => '')).slice(0, 200)}`);
+      return null;
+    }
+    const data = await res.json();
+    if (data.error && !/hasn't returned any results/i.test(data.error)) {
+      log(`  ⚠ SerpApi: ${data.error}`);
+      return null;
+    }
+    return (data.organic_results || []).map(r => ({ title: r.title, link: r.link, snippet: r.snippet }));
+  } catch (e) {
+    log(`  ⚠ SerpApi fetch failed: ${e.message}`);
+    return null;
+  }
+}
+
+async function searchBrightData(q) {
+  try {
+    // Bright Data runs a real Google search and returns it parsed (brd_json=1).
+    // It returns 10 results per call. tbs (time filter) is a normal Google parameter.
+    const url = `https://www.google.com/search?${new URLSearchParams({ q, gl: 'us', hl: 'en', tbs: `qdr:${WINDOW}`, brd_json: '1' })}`;
+    const res = await fetch('https://api.brightdata.com/request', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${BRIGHTDATA_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ zone: BRIGHTDATA_ZONE, url, format: 'raw' }),
+      signal: AbortSignal.timeout(60000),
+    });
+    if (!res.ok) {
+      log(`  ⚠ Bright Data error ${res.status}: ${(await res.text().catch(() => '')).slice(0, 200)}`);
+      return null;
+    }
+    const text = await res.text();
+    if (!text.trim()) { log('  ⚠ Bright Data returned an empty response (trying the next provider)'); return null; }
+    const data = JSON.parse(text);
+    return (data.organic || []).map(r => ({ title: r.title, link: r.link, snippet: r.description }));
+  } catch (e) {
+    log(`  ⚠ Bright Data fetch failed: ${e.message}`);
+    return null;
+  }
+}
+
+async function searchTavily(q, term) {
+  try {
+    const range = { d: 'day', w: 'week', m: 'month' }[WINDOW];
+    const res = await fetch('https://api.tavily.com/search', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TAVILY_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query: `${term} job (remote OR "San Francisco" OR "Bay Area")`,
+        include_domains: BOARDS,
+        time_range: range,
+        search_depth: 'basic',
+        max_results: 20,
+      }),
+      signal: AbortSignal.timeout(30000),
+    });
+    if (!res.ok) {
+      log(`  ⚠ Tavily error ${res.status}: ${(await res.text().catch(() => '')).slice(0, 200)}`);
+      return null;
+    }
+    const data = await res.json();
+    return (data.results || []).map(r => ({ title: r.title, link: r.url, snippet: r.content }));
+  } catch (e) {
+    log(`  ⚠ Tavily fetch failed: ${e.message}`);
+    return null;
+  }
+}
+
+// Providers come in two groups, all on free credits only. Every call is counted
+// in Supabase (api_quota) and stops before the free limit, so nothing is billed.
+//   combine: monthly-renewing credits. Every query goes to ALL of these and the
+//            results are merged (different engines surface different postings).
+//   backup:  SerpApi (small, shared) and Serper (one-time credits that never
+//            renew). Used only when every "combine" provider failed.
+const PROVIDERS = [
+  { name: 'tavily',     key: TAVILY_API_KEY,                          fn: searchTavily,     combine: true },
+  { name: 'brightdata', key: BRIGHTDATA_API_KEY && BRIGHTDATA_ZONE,   fn: searchBrightData, combine: true },
+  { name: 'serpapi',    key: SERPAPI_KEY,                             fn: searchSerpApi,    combine: false },
+  { name: 'serper',     key: SERPER_API_KEY,                          fn: searchSerper,     combine: false },
+].filter(p => p.key);
+const used = {};
+const exhausted = new Set();
+
+async function callProvider(p, q, term) {
+  if (exhausted.has(p.name)) return null;
+  if (!(await spend(supabase, p.name))) {
+    log(`  ⏭ ${p.name}: free budget used up`);
+    exhausted.add(p.name);
+    return null;
+  }
+  const results = await p.fn(q, term);
+  if (results !== null) used[p.name] = (used[p.name] || 0) + 1;
+  return results;
+}
+
+/** Runs one query on every "combine" provider and merges; falls back to the backups. */
+async function search(q, term) {
+  const merged = [];
+  const seen = new Set();
+  let anyWorked = false;
+  for (const p of PROVIDERS.filter(x => x.combine)) {
+    const results = await callProvider(p, q, term);
+    if (results === null) continue;
+    anyWorked = true;
+    for (const r of results) {
+      const key = String(r.link || '').replace(/^http:/, 'https:').replace(/[?#].*$/, '').replace(/\/$/, '').toLowerCase();
+      if (key && !seen.has(key)) { seen.add(key); merged.push(r); }
+    }
+  }
+  if (anyWorked) return merged;
+  for (const p of PROVIDERS.filter(x => !x.combine)) {
+    const results = await callProvider(p, q, term);
+    if (results !== null) return results;
+  }
+  return null;
+}
+const PROVIDER = PROVIDERS.map(p => p.name).join('+') || 'none';
+
+// ── Turn a search hit into a job candidate ───────────────────────────────────
+
+// "Job Application for Chief of Staff at Acme" / "Chief of Staff @ Acme" /
+// "Acme - Chief of Staff" / "Chief of Staff - Acme | Greenhouse"
+function cleanTitle(raw, company) {
+  let t = String(raw || '')
+    .replace(/&amp;/g, '&')
+    .replace(/^job application for\s+/i, '')
+    .replace(/\s*[|·]\s*(greenhouse|lever|ashby|workable|smartrecruiters|breezy.*)$/i, '')
+    .trim();
+  const m = t.match(/^(.*?)\s+(?:at|@)\s+([^|]+)$/i);
+  if (m) t = m[1].trim();
+  if (company) {
+    const esc = company.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    t = t.replace(new RegExp(`^${esc}\\s*[-–—:|]\\s*`, 'i'), '').replace(new RegExp(`\\s*[-–—:|]\\s*${esc}$`, 'i'), '');
+  }
+  return t.trim();
+}
+
+function companyFromResult(raw, link) {
+  const m = String(raw || '').match(/\s(?:at|@)\s+([^|\-–—]+?)(?:\s*[|\-–—].*)?$/i);
+  if (m) return m[1].trim();
+  const slug = guessCompanySlug(link);
+  return slug && slug !== 'unknown'
+    ? slug.replace(/[-_]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
+    : 'Unknown';
+}
 
 function resultToJob(item, searchTerm) {
-  const title = item.title || '';
-  const snippet = item.snippet || '';
   const link = item.link || '';
-
-  let company = 'Unknown';
-  try {
-    const u = new URL(link);
-    const parts = u.pathname.split('/').filter(Boolean);
-    if (parts.length > 0) {
-      company = parts[0].replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-    }
-  } catch (e) { /* leave as Unknown */ }
-
+  const company = companyFromResult(item.title, link);
+  const title = cleanTitle(item.title, company);
   return {
     job_title: title,
     company,
-    ats_type: 'google-search',
-    ats_slug: null,
+    ats_type: guessAtsType(link),
+    ats_slug: guessCompanySlug(link),
     external_id: link,
     url: link,
-    location: snippet,
-    description: snippet,
+    description: item.snippet || '',
     match_score: null,
-    source: `google-search:${searchTerm}`,
+    source: 'google-search',
+    term: searchTerm,
   };
 }
 
-// ── Insert jobs ───────────────────────────────────────────────────────────────
-// FIXED: onConflict was set to 'url', but the table's real unique
-// constraint, applications_ats_external_unique, is enforced on
-// (ats_type, external_id) -- NOT on url. This mismatch meant Postgres
-// couldn't resolve conflicts via ON CONFLICT and threw a hard duplicate-key
-// error, failing the entire batch instead of skipping individual repeat
-// rows. Same root cause and fix as discover-jobs-api.js.
+// ── Insert ───────────────────────────────────────────────────────────────────
+// Dedupe on url (unique) and on (ats_type, external_id). The Supabase triggers
+// classify the row; JS only decides queued (>=75) vs archived (1-74) like the
+// other discovery scripts, and the DB rescues archived apply/review rows.
 
 async function insertJobs(jobs) {
   if (jobs.length === 0) return { inserted: 0, archived: 0 };
 
-  const externalIds = jobs.map(j => j.external_id).filter(Boolean);
-  const { data: existing } = await supabase
-    .from('applications')
-    .select('external_id')
-    .in('external_id', externalIds);
-
-  const existingIds = new Set((existing || []).map(e => e.external_id));
-  const newJobs = jobs.filter(j => j.external_id && !existingIds.has(j.external_id));
-
-  if (newJobs.length === 0) return { inserted: 0, archived: 0 };
-
-  const toQueue = newJobs.filter(j => j.match_score >= 75);
-  const toArchive = newJobs.filter(j => j.match_score > 0 && j.match_score < 75);
-
-  let inserted = 0;
-  if (toQueue.length > 0) {
-    const { data, error } = await supabase.from('applications').upsert(
-      toQueue.map(j => ({
-        job_title: j.job_title,
-        company: j.company,
-        ats_type: j.ats_type,
-        ats_slug: j.ats_slug,
-        external_id: j.external_id,
-        url: j.url,
-        location: '',
-        status: 'queued',
-        match_score: j.match_score,
-        source: j.source,
-      })),
-      { onConflict: 'ats_type,external_id', ignoreDuplicates: true }
-    ).select();
-    if (error) log(`  ❌ Insert error (queue): ${error.message}`);
-    else inserted = (data || []).length;
+  const urls = jobs.map(j => j.url);
+  const known = new Set();
+  for (let i = 0; i < urls.length; i += 100) {
+    const { data, error } = await supabase.from('applications').select('url').in('url', urls.slice(i, i + 100));
+    if (error) { log(`  ⚠ existing-url lookup failed: ${error.message}`); continue; }
+    for (const r of data || []) known.add(r.url);
   }
+  const fresh = jobs.filter(j => !known.has(j.url));
+  log(`   ${jobs.length - fresh.length} already in the database, ${fresh.length} new`);
+  if (fresh.length === 0) return { inserted: 0, archived: 0 };
 
-  let archived = 0;
-  if (toArchive.length > 0) {
-    const { data, error } = await supabase.from('applications').upsert(
-      toArchive.map(j => ({
-        job_title: j.job_title,
-        company: j.company,
-        ats_type: j.ats_type,
-        ats_slug: j.ats_slug,
-        external_id: j.external_id,
-        url: j.url,
-        location: '',
-        status: 'archived',
-        match_score: j.match_score,
-        source: j.source,
-      })),
-      { onConflict: 'ats_type,external_id', ignoreDuplicates: true }
-    ).select();
-    if (error) log(`  ❌ Insert error (archive): ${error.message}`);
-    else archived = (data || []).length;
+  const toRow = (j, status) => ({
+    job_title: j.job_title,
+    company: j.company,
+    ats_type: j.ats_type,
+    ats_slug: j.ats_slug,
+    external_id: j.external_id,
+    url: j.url,
+    location: '',
+    status,
+    match_score: j.match_score,
+    source: j.source,
+  });
+
+  const queue = fresh.filter(j => j.match_score >= 75).map(j => toRow(j, 'queued'));
+  const archive = fresh.filter(j => j.match_score > 0 && j.match_score < 75).map(j => toRow(j, 'archived'));
+
+  let inserted = 0, archived = 0;
+  for (const [rows, kind] of [[queue, 'queue'], [archive, 'archive']]) {
+    if (rows.length === 0) continue;
+    const { data, error } = await supabase
+      .from('applications')
+      .upsert(rows, { onConflict: 'url', ignoreDuplicates: true })
+      .select('id');
+    if (error) { log(`  ❌ Insert error (${kind}): ${error.message}`); continue; }
+    if (kind === 'queue') inserted = (data || []).length; else archived = (data || []).length;
   }
-
   return { inserted, archived };
 }
 
-// ── Main ─────────────────────────────────────────────────────────────────
+// ── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-  if (!GOOGLE_SEARCH_API_KEY || !GOOGLE_SEARCH_ENGINE_ID) {
-    log('⚠ GOOGLE_SEARCH_API_KEY or GOOGLE_SEARCH_ENGINE_ID not set — skipping');
-    return;
+  if (PROVIDERS.length === 0) {
+    const msg = 'No search API key set: add BRIGHTDATA_API_KEY + BRIGHTDATA_ZONE, TAVILY_API_KEY, SERPER_API_KEY or SERPAPI_KEY as a GitHub secret';
+    log(`❌ ${msg}`);
+    await logRun(supabase, 'discover-jobs-google', { errors: 1, notes: msg });
+    throw new Error(msg);
   }
 
   const terms = pickTermsForToday();
-  log(`🚀 Starting Google Custom Search discovery — ${terms.length} terms today`);
-  log(`   Terms: ${terms.join(', ')}`);
+  log(`🚀 Site-scoped search via ${PROVIDER} — ${terms.length} queries${DRY_RUN ? ' (DRY RUN)' : ''}`);
 
-  let allJobs = [];
+  const all = [];
+  let failed = 0;
 
   for (const term of terms) {
-    const results = await searchGoogle(term);
-    log(`  "${term}": ${results.length} result(s)`);
+    const q = `${SITE_CLAUSE} ${term} ${PLACE_CLAUSE}`;
+    const results = await search(q, term);
+    if (results === null) { failed++; await sleep(800); continue; }
 
+    let kept = 0;
     for (const item of results) {
+      if (!looksLikeJobUrl(item.link)) continue;
       const job = resultToJob(item, term);
       job.match_score = scoreJob({
         title: job.job_title,
         department: '',
         description: job.description,
-        location: job.location,
+        location: job.description,
         company: job.company,
       });
-      if (job.match_score > 0) allJobs.push(job);
+      if (job.match_score > 0) { all.push(job); kept++; }
     }
-
-    await sleep(500);
+    log(`  ${term}: ${results.length} result(s), ${kept} relevant`);
+    await sleep(800);
   }
 
+  // Fail loudly: a run where every query failed must not look green.
+  if (failed === terms.length) {
+    const msg = `All ${terms.length} searches failed via ${PROVIDER} (keys wrong, or every free budget used up: see view api_quota_status)`;
+    await logRun(supabase, 'discover-jobs-google', { errors: failed, notes: msg });
+    throw new Error(msg);
+  }
+  if (failed > 0) log(`  ⚠ ${failed}/${terms.length} searches failed`);
+
   const seen = new Set();
-  const uniqueJobs = allJobs.filter(j => {
-    if (!j.external_id || seen.has(j.external_id)) return false;
-    seen.add(j.external_id);
-    return true;
+  const unique = all.filter(j => (seen.has(j.url) ? false : (seen.add(j.url), true)));
+  log(`\n📊 Relevant jobs found: ${unique.length} (${unique.filter(j => j.match_score >= 75).length} score 75+)`);
+
+  if (DRY_RUN) {
+    for (const j of unique.slice(0, 60)) log(`   [${j.match_score}] ${j.company} — ${j.job_title} — ${j.url}`);
+    return;
+  }
+
+  const { inserted, archived } = await insertJobs(unique);
+  log(`✅ Queued ${inserted} new jobs, archived ${archived} lower-score jobs`);
+  await logRun(supabase, 'discover-jobs-google', {
+    found: unique.length, inserted, archived, errors: failed, notes: `providers=${JSON.stringify(used)} window=${WINDOW}`,
   });
-
-  log(`\n📊 Scored jobs found: ${uniqueJobs.length} (score > 0)`);
-  log(`   Total queued (75+): ${uniqueJobs.filter(j => j.match_score >= 75).length}`);
-
-  const { inserted, archived } = await insertJobs(uniqueJobs);
-  log(`\n✅ Inserted ${inserted} new jobs into queue`);
-  log(`🗄 Archived ${archived} low-score jobs`);
 }
 
 main().catch(err => {

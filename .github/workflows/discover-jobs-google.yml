@@ -1,13 +1,27 @@
-name: Job Autopilot - Discover Jobs (Google Search)
+name: Job Autopilot - Discover Jobs (Web Search)
+
+# Searches the ATS job boards (Ashby, Greenhouse, Lever, Workable, SmartRecruiters...)
+# for target titles through Serper.dev (or SerpApi as a fallback).
+# The old Google Custom Search API returns 403 and is being retired.
 
 on:
   schedule:
     - cron: "0 17 * * 1-5"
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run: print matches, write nothing to Supabase'
+        required: false
+        default: false
+        type: boolean
+      queries_per_run:
+        description: 'Number of search queries to run'
+        required: false
+        default: '12'
 
 jobs:
-  discover-google:
-    name: Discover via Google Custom Search
+  discover-web:
+    name: Discover via web search
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -18,10 +32,12 @@ jobs:
           node-version: "24"
       - run: npm install
 
-      - name: Run Google Search discovery
+      - name: Run web search discovery
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-          GOOGLE_SEARCH_API_KEY: ${{ secrets.GOOGLE_SEARCH_API_KEY }}
-          GOOGLE_SEARCH_ENGINE_ID: ${{ secrets.GOOGLE_SEARCH_ENGINE_ID }}
+          SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
+          SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          QUERIES_PER_RUN: ${{ github.event.inputs.queries_per_run || '12' }}
         run: node discover-jobs-google.js

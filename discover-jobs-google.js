@@ -151,7 +151,9 @@ async function searchBrightData(q) {
       log(`  ⚠ Bright Data error ${res.status}: ${(await res.text().catch(() => '')).slice(0, 200)}`);
       return null;
     }
-    const data = await res.json();
+    const text = await res.text();
+    if (!text.trim()) { log('  ⚠ Bright Data returned an empty response (trying the next provider)'); return null; }
+    const data = JSON.parse(text);
     return (data.organic || []).map(r => ({ title: r.title, link: r.link, snippet: r.description }));
   } catch (e) {
     log(`  ⚠ Bright Data fetch failed: ${e.message}`);

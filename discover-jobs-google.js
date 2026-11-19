@@ -11,7 +11,7 @@
  *   2. SerpApi     (SERPAPI_KEY)      — fallback, already used by discover-jobs.js.
  *
  * Each query is: (site:board1 OR site:board2 ...) "title" (remote OR Bay Area terms)
- * limited to the past week, so every run mostly returns new postings.
+ * limited to the past 24 hours by default (SEARCH_WINDOW=d|w|m), so every run mostly returns new postings.
  * Results are scored with lib/scoring.js (same as every other source); the
  * Supabase triggers then assign the fit tier.
  *
@@ -32,6 +32,8 @@ const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const SERPER_API_KEY = process.env.SERPER_API_KEY;
 const SERPAPI_KEY = process.env.SERPAPI_KEY;
 const QUERIES_PER_RUN = parseInt(process.env.QUERIES_PER_RUN || '12', 10);
+// Time window for results: d = past 24 hours (default), w = past week, m = past month
+const WINDOW = ['d','w','m'].includes(process.env.SEARCH_WINDOW) ? process.env.SEARCH_WINDOW : 'd';
 const DRY_RUN = String(process.env.DRY_RUN || '').toLowerCase() === 'true';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
@@ -92,7 +94,7 @@ async function searchSerper(q) {
     const res = await fetch('https://google.serper.dev/search', {
       method: 'POST',
       headers: { 'X-API-KEY': SERPER_API_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ q, num: 20, gl: 'us', hl: 'en', tbs: 'qdr:w' }),
+      body: JSON.stringify({ q, num: 20, gl: 'us', hl: 'en', tbs: `qdr:${WINDOW}` }),
       signal: AbortSignal.timeout(20000),
     });
     if (!res.ok) {
@@ -109,7 +111,7 @@ async function searchSerper(q) {
 
 async function searchSerpApi(q) {
   try {
-    const params = new URLSearchParams({ engine: 'google', q, num: '20', tbs: 'qdr:w', gl: 'us', hl: 'en', api_key: SERPAPI_KEY });
+    const params = new URLSearchParams({ engine: 'google', q, num: '20', tbs: `qdr:${WINDOW}`, gl: 'us', hl: 'en', api_key: SERPAPI_KEY });
     const res = await fetch(`https://serpapi.com/search.json?${params}`, { signal: AbortSignal.timeout(25000) });
     if (!res.ok) {
       log(`  ⚠ SerpApi error ${res.status}: ${(await res.text().catch(() => '')).slice(0, 200)}`);
@@ -282,7 +284,7 @@ async function main() {
   const { inserted, archived } = await insertJobs(unique);
   log(`✅ Queued ${inserted} new jobs, archived ${archived} lower-score jobs`);
   await logRun(supabase, 'discover-jobs-google', {
-    found: unique.length, inserted, archived, errors: failed, notes: `provider=${PROVIDER}`,
+    found: unique.length, inserted, archived, errors: failed, notes: `provider=${PROVIDER} window=${WINDOW}`,
   });
 }
 

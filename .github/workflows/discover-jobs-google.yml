@@ -6,7 +6,7 @@ name: Job Autopilot - Discover Jobs (Web Search)
 
 on:
   schedule:
-    - cron: "0 17 * * 1-5"
+    - cron: "0 16 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -14,6 +14,10 @@ on:
         required: false
         default: false
         type: boolean
+      search_window:
+        description: 'Time window: d = past 24 hours, w = past week, m = past month'
+        required: false
+        default: 'd'
       queries_per_run:
         description: 'Number of search queries to run'
         required: false
@@ -39,5 +43,6 @@ jobs:
           SERPER_API_KEY: ${{ secrets.SERPER_API_KEY }}
           SERPAPI_KEY: ${{ secrets.SERPAPI_KEY }}
           DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          SEARCH_WINDOW: ${{ github.event.inputs.search_window || 'd' }}
           QUERIES_PER_RUN: ${{ github.event.inputs.queries_per_run || '12' }}
         run: node discover-jobs-google.js

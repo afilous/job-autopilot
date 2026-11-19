@@ -76,9 +76,10 @@ function parseHeadline(title, snippet) {
   const m = t.match(HEADLINE_RE);
   if (!m) return null;
   let name = m[1].replace(/^["'“”]+|["'“”,:]+$/g, '').trim();
+  name = name.replace(/^[A-Z][a-z]+'s\s+(?=\S)/, '');
   if (!name || name.split(/\s+/).length > 5 || NOT_A_STARTUP.test(name)) return null;
   if (/^(how|why|what|these|this|the best|top|\d+)/i.test(name)) return null;
-  const stage = stageOf(`${t} ${snippet || ''}`.slice(0, 400));
+  const stage = stageOf(t) || stageOf(String(snippet || '').slice(0, 300));
   if (!stage) return null;
   const amount = amountOf(m[2], m[3]);
   if (amount !== null && amount > 150e6) return null; // not early stage
@@ -129,7 +130,7 @@ async function main() {
       if (!h) continue;
       const k = keyOf(h.name);
       if (k.length < 3 || found.has(k)) continue;
-      found.set(k, { ...h, name_key: k, headline: r.title, source_url: r.link });
+      found.set(k, { ...h, name_key: k, headline: r.title, source_url: /^https?:\/\/(www\.)?google\./i.test(r.link || '') ? null : r.link });
       kept++;
     }
     log(`  "${q}": ${results.length} result(s), ${kept} new company(ies)`);
